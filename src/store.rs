@@ -61,6 +61,9 @@ pub struct EntryRecord {
     #[serde(rename = "type")]
     pub ty: EntryType,
     pub labels: Labels,
+    /// What the entry is for, so agents can pick the right one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     /// Non-secret field values of the current version.
     pub public: BTreeMap<String, String>,
     pub secret_fields: Vec<String>,
@@ -106,6 +109,8 @@ pub struct Payload {
     #[serde(rename = "ref")]
     pub entry_ref: EntryRef,
     pub labels: Labels,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     pub fields: Fields,
     pub public_fields: BTreeSet<String>,
 }
@@ -125,6 +130,8 @@ pub struct PendingMeta {
     #[serde(rename = "ref")]
     pub entry_ref: EntryRef,
     pub labels: Labels,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     pub digest: String,
     pub created_at: String,
     pub submitter: Submitter,
@@ -471,6 +478,7 @@ impl Vault {
     /// Encrypts a candidate with the public recipients only and stores it as pending.
     /// No passphrase is needed; activation verifies and publishes it. For a rotation,
     /// `labels` are merged over the entry's current labels.
+    #[allow(clippy::too_many_arguments)]
     pub fn submit(
         &self,
         entry_ref: &EntryRef,
@@ -478,8 +486,12 @@ impl Vault {
         mut fields: Fields,
         public_fields: BTreeSet<String>,
         mut labels: Labels,
+        mut description: Option<String>,
         rotate: bool,
     ) -> Result<PendingMeta> {
+        if let Some(d) = &description {
+            check_description(d)?;
+        }
         let (entry_id, version) = match (self.find(entry_ref), rotate) {
             (Some(_), false) => {
                 bail!("{entry_ref} already exists; use `jinnang rotate` for a new version")
@@ -495,6 +507,9 @@ impl Vault {
                 let mut merged = e.labels.clone();
                 merged.append(&mut labels);
                 labels = merged;
+                if description.is_none() {
+                    description = e.description.clone();
+                }
                 (e.id, e.current + 1)
             }
             (None, false) => (Uuid::new_v4(), 1),
@@ -510,6 +525,7 @@ impl Vault {
             header: header.clone(),
             entry_ref: entry_ref.clone(),
             labels: labels.clone(),
+            description: description.clone(),
             fields,
             public_fields,
         };
@@ -520,6 +536,7 @@ impl Vault {
             header,
             entry_ref: entry_ref.clone(),
             labels,
+            description,
             digest: crypto::sha256(&ciphertext),
             created_at: now(),
             submitter: submitter(),
@@ -588,7 +605,8 @@ impl Vault {
         ensure!(
             h == &pending.header
                 && payload.entry_ref == pending.entry_ref
-                && payload.labels == pending.labels,
+                && payload.labels == pending.labels
+                && payload.description == pending.description,
             "pending candidate {id}: payload does not match its record"
         );
         ensure!(
@@ -656,6 +674,7 @@ impl Vault {
                 e.versions.push(version);
                 e.current = h.version;
                 e.labels = payload.labels.clone();
+                e.description = payload.description.clone();
                 e.public = public;
                 e.secret_fields = secret_fields;
                 e.updated_at = now();
@@ -667,6 +686,7 @@ impl Vault {
                     entry_ref: payload.entry_ref.clone(),
                     ty: h.ty,
                     labels: payload.labels.clone(),
+                    description: payload.description.clone(),
                     public,
                     secret_fields,
                     current: 1,
@@ -724,6 +744,40 @@ impl Vault {
         let labels = e.labels.clone();
         self.commit(keys, manifest)?;
         Ok(labels)
+    }
+
+    /// Sets (Some) or clears (None) the description (no new version).
+    pub fn describe(
+        &mut self,
+        keys: &KeyMaterial,
+        entry_ref: &EntryRef,
+        description: Option<String>,
+    ) -> Result<()> {
+        if let Some(d) = &description {
+            check_description(d)?;
+        }
+        let mut manifest = self.manifest.clone();
+        let e = Self::live_mut(&mut manifest, entry_ref)?;
+        e.description = description;
+        e.updated_at = now();
+        self.commit(keys, manifest)
+    }
+
+    /// Entries whose metadata contains every term (case-insensitive): name, type,
+    /// labels, description, public field names and values, and secret field names.
+    pub fn search(&self, terms: &[String]) -> Vec<&EntryRecord> {
+        let terms: Vec<String> = terms.iter().map(|t| t.to_lowercase()).collect();
+        self.entries()
+            .filter(|e| {
+                let mut hay = vec![e.entry_ref.path.clone(), e.ty.as_str().to_string()];
+                hay.extend(e.labels.iter().map(|(k, v)| format!("{k}={v}")));
+                hay.extend(e.description.clone());
+                hay.extend(e.public.iter().map(|(k, v)| format!("{k}={v}")));
+                hay.extend(e.secret_fields.iter().cloned());
+                let hay = hay.join("\n").to_lowercase();
+                terms.iter().all(|t| hay.contains(t.as_str()))
+            })
+            .collect()
     }
 
     /// Renames an entry. Ciphertexts are bound to the entry id, not the name.
@@ -1072,4 +1126,18 @@ fn allowed_backup_path(rel: &Path) -> bool {
             .is_some_and(valid_pending_id),
         _ => false,
     }
+}
+
+/// Descriptions are one line of plain text shown to agents choosing an entry.
+pub fn check_description(d: &str) -> Result<()> {
+    ensure!(!d.trim().is_empty(), "description is empty");
+    ensure!(
+        d.chars().count() <= 500,
+        "description is longer than 500 characters"
+    );
+    ensure!(
+        !d.chars().any(char::is_control),
+        "description must be a single line without control characters"
+    );
+    Ok(())
 }

@@ -46,13 +46,14 @@ cargo install --path .
 # 创建 vault，口令至少 12 个字符；恢复包请转移到离线位置
 jinnang init --recovery-kit ~/jinnang-recovery.json
 
-# 录入：非秘密字段明文回显，秘密字段不回显；-l 打标签
-jinnang set jn://acme/app-db --type dsn -l env=prod -l team=platform
+# 录入：非秘密字段明文回显，秘密字段不回显；-l 打标签，--desc 写一句用途
+jinnang set jn://acme/app-db --type dsn -l env=prod -l team=platform --desc 'acme 生产库应用角色'
 jinnang set jn://acme/ops-otp --type totp            # 可直接粘贴 otpauth:// URI
 jinnang set jn://notion --field api_key --field workspace --public workspace   # generic 类型，自定义字段
 jinnang import-env ./app.env jn://acme/app-env --public PORT,NODE_ENV -l env=dev
 
-# 查看（不含秘密值）；-l 按标签过滤
+# 查看（不含秘密值，不需要口令）；-l 按标签过滤，find 按关键词检索
+jinnang find acme prod
 jinnang ls
 jinnang ls -l 'env=prod,team in (platform,data)'
 jinnang inspect jn://acme/app-db --json
@@ -64,8 +65,9 @@ jinnang run jn://acme/deploy-key --file KEY=private_key -- ssh -i {KEY} -o Ident
 jinnang run jn://acme/app-env --env-file CREDS -- ./deploy.sh --credentials {CREDS}
 jinnang run jn://acme/token --stdin token -- mycli login --token-stdin
 
-# 整理：改标签（key- 删除）、改名；都不产生新版本
+# 整理：改标签（key- 删除）、改说明、改名；都不产生新版本
 jinnang label jn://acme/app-db owner=alice team-
+jinnang describe jn://acme/app-db 'acme 生产库应用角色，只读查询用 reader 账号'
 jinnang mv jn://acme/app-db jn://acme/prod/app-db
 
 # 新版本 / 删除
@@ -125,6 +127,25 @@ jinnang run -l tenant=poc,role=sales --env PW=password -- ./login.sh
 | `JINNANG_VAULT` | vault 目录，默认 `$XDG_DATA_HOME/jinnang/vault` |
 | `JINNANG_PASSPHRASE_FILE` | 从文件读取口令，例如 systemd 加密凭证解出的文件；未设置时从终端读取 |
 | `JINNANG_STATE_DIR` | 信任状态目录，记录钉住的签名公钥和最高清单序号；默认 `$XDG_STATE_HOME/jinnang` |
+
+## 给 Agent 用
+
+仓库自带一个 agent 技能 [`skills/jinnang`](skills/jinnang/SKILL.md)，写明查找账号、注入各类凭证、存入新凭证和出错处理的做法。安装后，支持技能的 agent（Claude Code、Codex 等）遇到账号、token、SSH、数据库连接这类任务时会自动加载它：
+
+```sh
+ln -s "$PWD/skills/jinnang" ~/.agents/skills/jinnang     # Codex 等读取 ~/.agents/skills
+ln -s ~/.agents/skills/jinnang ~/.claude/skills/jinnang  # Claude Code
+```
+
+没装技能的 agent 运行 `jinnang --help` 会看到提示，`jinnang --skill` 直接打印同一份技能。
+
+**agent 怎么知道该用哪个账号**：agent 手里通常只有任务描述（「用 poc 租户的销售账号验收」「连 web1 看日志」），不知道库里有什么。Jinnang 的清单不需要口令就能查，且只含元数据：
+
+- `jinnang find <关键词...>` 在名称、标签、用途说明、公开字段（用户名、主机、URL）和字段名里检索，所有关键词都命中才列出；秘密值不参与检索；
+- `jinnang ls -l <选择器>` 按标签精确筛选，`jinnang inspect` 查看单个条目；
+- 用 `run`、`inspect` 时，选择器必须恰好命中一个条目，否则报错并列出候选，agent 不能「挑一个差不多的」。
+
+所以录入时值得多写一点元数据：用 `--desc` 说明系统、租户、角色和用途；从旧明文文件迁移时，把原文件名和变量名写进说明，读到旧记忆的 agent 也能按文件名找到对应条目。
 
 ## 安全边界（M1）
 

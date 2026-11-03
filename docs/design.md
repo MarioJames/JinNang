@@ -97,7 +97,7 @@ $XDG_STATE_HOME/jinnang/<hash>.json  信任状态：钉住的 vault_id、签名�
 ```
 
 - **密文载荷**：`{"header": {vault_id, entry_id, version, type}, "ref", "labels", "fields": {...}, "public_fields": [...]}`。读取时核对 header，防止密文在条目、版本或 vault 之间换位。header 不含名称，所以条目可以改名而不必重新加密；载荷里的 ref 和标签只记录写入时的状态。
-- **清单签名覆盖的内容**：vault_id、两个接收者、签名公钥、每个条目的 ref/类型/标签/公开字段/版本/密文摘要/删除状态，以及序号。
+- **清单签名覆盖的内容**：vault_id、两个接收者、签名公钥、每个条目的 ref/类型/标签/用途说明/公开字段/版本/密文摘要/删除状态，以及序号。
 - **打开时的校验**：
   - 签名有效；
   - 清单与 `vault.json` 一致；
@@ -142,13 +142,14 @@ $XDG_STATE_HOME/jinnang/<hash>.json  信任状态：钉住的 vault_id、签名�
   - sudo 固定动作、credential helper、kubectl/PG 代理；
   - TPM/YubiKey 插件、多机同步。
 
-## 7. 给 agent 的约定（草稿）
+## 7. 给 agent 的约定
 
-```text
-## 凭证（jinnang）
-- 只用 jn:// 引用；不读取、打印或复制凭证文件、.env 的值、token、验证码、cookie、DSN。
-- 缺凭证时运行 jinnang need，把生成的录入指令交给用户；不让用户在对话或 Markdown 中粘贴明文。
-- 先用 jinnang ls -l / inspect 按标签（如 env、tenant、role）核对目标；选择器必须唯一命中，不猜测，不回退到其他账号。
-- 不把凭证或 token 写入记忆、报告、测试快照、日志或提交。
-- 疑似泄露时停止相关操作，报告引用，由用户轮换。
-```
+完整约定见随仓库发布的技能 [`skills/jinnang/SKILL.md`](../skills/jinnang/SKILL.md)，`jinnang --skill` 打印同一份内容。要点：
+
+- 只用 `jn://` 引用；不读取、打印或复制凭证文件、`.env` 的值、token、验证码、cookie、DSN。
+- **发现**：先 `jinnang find <关键词>` 或 `jinnang ls -l <选择器>`，再 `inspect` 核对；清单只含元数据（名称、标签、用途说明、公开字段、字段名），读取不需要口令。选择器必须唯一命中，不猜测、不回退到其他账号。
+- 缺凭证时运行 `jinnang need`，把生成的录入指令交给用户；不让用户在对话中粘贴明文。
+- agent 生成的新凭证从生成器经管道存入 `jinnang set --stdin-json`，并写 `--desc` 和标签，供以后的 agent 发现。
+- 不把凭证或 token 写入记忆、报告、测试快照、日志或提交；疑似泄露时停止相关操作，报告引用，由用户轮换。
+
+用途说明（description）写在签名清单中，可随 `set`/`rotate`/`import-env --desc` 或 `jinnang describe` 修改，不产生新版本。

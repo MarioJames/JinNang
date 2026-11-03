@@ -775,3 +775,151 @@ fn generic_entries_take_custom_fields_secret_unless_public() {
     ]));
     assert!(env_check.ok, "{}", env_check.text);
 }
+
+#[test]
+fn agents_discover_entries_by_keywords_and_descriptions() {
+    let env = Env::new();
+    env.init();
+    let skill = run(env.cmd().arg("--skill"));
+    assert!(
+        skill.ok && skill.text.starts_with("---\nname: jinnang\n"),
+        "{}",
+        skill.text
+    );
+    let help = run(env.cmd().arg("--help"));
+    assert!(help.text.contains("jinnang --skill"), "{}", help.text);
+
+    let set = run(env
+        .cmd()
+        .args([
+            "set",
+            "jn://work/poc/qa-sales",
+            "--type",
+            "account",
+            "--stdin-json",
+            "-l",
+            "tenant=poc",
+            "--desc",
+            "POC tenant sales QA account (was poc-qa-accounts.env QA_SALES_*)",
+        ])
+        .write_stdin(r#"{"username":"sales@example.com","password":"pw-sales-1111"}"#));
+    assert!(set.ok, "{}", set.text);
+    let ssh = run(env
+        .cmd()
+        .args([
+            "set",
+            "jn://ssh/web1",
+            "--type",
+            "ssh",
+            "--stdin-json",
+            "--pending",
+        ])
+        .write_stdin(r#"{"host":"10.0.0.7","user":"root","password":"pw-ssh-2222"}"#));
+    assert!(ssh.ok, "{}", ssh.text);
+    assert!(run(env.cmd().args(["pending", "activate", "--all"])).ok);
+
+    let refs = |args: &[&str]| -> Vec<String> {
+        let out = run(env.cmd().args(args));
+        assert!(out.ok, "{}", out.text);
+        let v: Value = serde_json::from_str(&out.text).unwrap();
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["ref"].as_str().unwrap().to_string())
+            .collect()
+    };
+    // Any mix of name, label, description, public value or field name; all terms must match.
+    assert_eq!(
+        refs(&["find", "--json", "POC", "Sales"]),
+        ["jn://work/poc/qa-sales"]
+    );
+    assert_eq!(
+        refs(&["find", "--json", "poc-qa-accounts.env"]),
+        ["jn://work/poc/qa-sales"]
+    );
+    assert_eq!(refs(&["find", "--json", "10.0.0.7"]), ["jn://ssh/web1"]);
+    assert_eq!(
+        refs(&["find", "--json", "password"]),
+        ["jn://ssh/web1", "jn://work/poc/qa-sales"]
+    );
+    assert!(refs(&["find", "--json", "poc", "10.0.0.7"]).is_empty());
+    // Secret values are never searchable.
+    assert!(refs(&["find", "--json", "pw-sales-1111"]).is_empty());
+
+    let ls = run(env.cmd().arg("ls"));
+    assert!(
+        ls.text.contains("\n    POC tenant sales QA account"),
+        "{}",
+        ls.text
+    );
+    let none = run(env.cmd().args(["find", "nothing-like-this"]));
+    assert!(
+        none.ok && none.text.contains("jinnang need"),
+        "{}",
+        none.text
+    );
+
+    // Descriptions survive rotation, can be replaced or cleared, and are signed.
+    let rot = run(env
+        .cmd()
+        .args(["rotate", "jn://work/poc/qa-sales", "--stdin-json"])
+        .write_stdin(r#"{"username":"sales@example.com","password":"pw-sales-3333"}"#));
+    assert!(rot.ok, "{}", rot.text);
+    assert_eq!(
+        refs(&["find", "--json", "QA_SALES"]),
+        ["jn://work/poc/qa-sales"]
+    );
+    assert!(
+        run(env
+            .cmd()
+            .args(["describe", "jn://ssh/web1", "build host for acme"]))
+        .ok
+    );
+    assert_eq!(
+        refs(&["find", "--json", "acme", "build"]),
+        ["jn://ssh/web1"]
+    );
+    assert!(!run(env.cmd().args(["describe", "jn://ssh/web1", "two\nlines"])).ok);
+    assert!(
+        run(env
+            .cmd()
+            .args(["describe", "jn://work/poc/qa-sales", "--clear"]))
+        .ok
+    );
+    assert!(refs(&["find", "--json", "QA_SALES"]).is_empty());
+    let need = run(env.cmd().args([
+        "need",
+        "jn://work/acme/admin",
+        "--type",
+        "account",
+        "--desc",
+        "acme admin console owner",
+    ]));
+    assert!(
+        need.text.contains("--desc 'acme admin console owner'"),
+        "{}",
+        need.text
+    );
+    let mut signed: Value =
+        serde_json::from_slice(&fs::read(env.vault().join("manifest.json")).unwrap()).unwrap();
+    signed["body"] = Value::String(
+        signed["body"]
+            .as_str()
+            .unwrap()
+            .replace("build host", "evil host"),
+    );
+    fs::write(
+        env.vault().join("manifest.json"),
+        serde_json::to_vec(&signed).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        run(env.cmd().arg("ls"))
+            .text
+            .contains("signature is invalid")
+    );
+
+    for out in [&set.text, &ls.text, &none.text, &rot.text] {
+        assert!(!out.contains("pw-"), "{out}");
+    }
+}

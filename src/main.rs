@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail, ensure};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use serde_json::json;
 
 use jinnang::crypto::{self, KeyMaterial};
@@ -20,14 +20,23 @@ use jinnang::store::{EntryRecord, PendingMeta, Vault};
 /// References are free-form names (`jn://<path>[#field][@vN]`); classify entries with
 /// labels (`-l key=value`) and select them with label selectors (`-l 'k=v,k2 in (a,b)'`).
 #[derive(Parser)]
-#[command(name = "jinnang", version)]
+#[command(
+    name = "jinnang",
+    version,
+    after_help = "Agents: SKIP if the Jinnang skill is already in your context. Otherwise run: jinnang --skill\nFind an account: jinnang find <keywords>   (no passphrase needed; never prints secret values)"
+)]
 struct Cli {
     /// Vault directory [env: JINNANG_VAULT] [default: $XDG_DATA_HOME/jinnang/vault]
     #[arg(long, global = true)]
     vault: Option<PathBuf>,
+    /// Print the agent skill file and exit
+    #[arg(long)]
+    skill: bool,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
+
+const SKILL: &str = include_str!("../skills/jinnang/SKILL.md");
 
 /// An entry given by name, or by a selector that must match exactly one entry.
 #[derive(clap::Args)]
@@ -87,6 +96,9 @@ enum Command {
         /// key=value label (repeatable)
         #[arg(short = 'l', long = "label", value_name = "KEY=VALUE")]
         labels: Vec<String>,
+        /// One line saying what the entry is for (shown to agents choosing an entry)
+        #[arg(long)]
+        desc: Option<String>,
         /// Only write a pending candidate; do not ask for the passphrase
         #[arg(long)]
         pending: bool,
@@ -99,6 +111,9 @@ enum Command {
         /// key=value label the new entry should carry (repeatable)
         #[arg(short = 'l', long = "label", value_name = "KEY=VALUE")]
         labels: Vec<String>,
+        /// What the entry is for; becomes its --desc
+        #[arg(long)]
+        desc: Option<String>,
         #[arg(long)]
         reason: Option<String>,
     },
@@ -106,6 +121,15 @@ enum Command {
     Pending {
         #[command(subcommand)]
         action: PendingAction,
+    },
+    /// Find entries whose name, labels, description or field names contain every keyword
+    ///
+    /// Example: jinnang find poc sales
+    Find {
+        #[arg(required = true)]
+        terms: Vec<String>,
+        #[arg(long)]
+        json: bool,
     },
     /// List entries, optionally filtered by a label selector (no secret values)
     Ls {
@@ -126,6 +150,14 @@ enum Command {
         reference: String,
         #[arg(required = true, value_name = "KEY=VALUE|KEY-")]
         changes: Vec<String>,
+    },
+    /// Set or clear an entry's description (what it is for)
+    Describe {
+        reference: String,
+        #[arg(required_unless_present = "clear")]
+        description: Option<String>,
+        #[arg(long, conflicts_with = "description")]
+        clear: bool,
     },
     /// Rename an entry
     Mv { from: String, to: String },
@@ -194,6 +226,9 @@ struct WriteOpts {
     /// Custom fields whose values are not secret (comma separated)
     #[arg(long, value_delimiter = ',')]
     public: Vec<String>,
+    /// One line saying what the entry is for (shown to agents choosing an entry)
+    #[arg(long)]
+    desc: Option<String>,
     /// Read field values as a JSON object from stdin
     #[arg(long)]
     stdin_json: bool,
@@ -247,8 +282,16 @@ fn parse_labels(raw: &[String]) -> Result<Labels> {
 }
 
 fn run(cli: Cli) -> Result<()> {
+    if cli.skill {
+        print!("{SKILL}");
+        return Ok(());
+    }
+    let Some(command) = cli.command else {
+        Cli::command().print_help()?;
+        return Ok(());
+    };
     let dir = vault_dir(&cli.vault)?;
-    match cli.command {
+    match command {
         Command::Init { recovery_kit } => {
             let passphrase = input::new_passphrase()?;
             let meta = Vault::init(&dir, &passphrase, &recovery_kit)?;
@@ -283,6 +326,7 @@ fn run(cli: Cli) -> Result<()> {
             reference,
             public,
             labels,
+            desc,
             pending,
         } => {
             let entry = Reference::parse_entry(&reference)?;
@@ -295,6 +339,7 @@ fn run(cli: Cli) -> Result<()> {
                 fields,
                 public,
                 parse_labels(&labels)?,
+                desc,
                 pending,
                 exists,
             )?;
@@ -303,6 +348,7 @@ fn run(cli: Cli) -> Result<()> {
             reference,
             ty,
             labels,
+            desc,
             reason,
         } => {
             let entry = Reference::parse_entry(&reference)?;
@@ -320,7 +366,12 @@ fn run(cli: Cli) -> Result<()> {
             if let Some(reason) = reason {
                 println!("Needed for: {reason}");
             }
-            let label_args: String = labels.iter().map(|(k, v)| format!(" -l {k}={v}")).collect();
+            let mut label_args: String =
+                labels.iter().map(|(k, v)| format!(" -l {k}={v}")).collect();
+            if let Some(d) = desc {
+                jinnang::store::check_description(&d)?;
+                label_args.push_str(&format!(" --desc '{}'", d.replace('\'', "'\\''")));
+            }
             let cmd = match ty {
                 EntryType::EnvBundle => format!("jinnang import-env <file> {entry}{label_args}"),
                 EntryType::Generic => format!("jinnang set {entry} --field <NAME>...{label_args}"),
@@ -333,29 +384,21 @@ fn run(cli: Cli) -> Result<()> {
         Command::Ls { selector, json } => {
             let selector = selector.as_deref().map(Selector::parse).transpose()?;
             let vault = Vault::open(&dir, false)?;
-            let mut entries: Vec<&EntryRecord> = match &selector {
+            let entries: Vec<&EntryRecord> = match &selector {
                 Some(s) => vault.select(s),
                 None => vault.entries().collect(),
             };
-            entries.sort_by(|a, b| a.entry_ref.cmp(&b.entry_ref));
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(
-                        &entries.iter().map(|e| entry_json(e)).collect::<Vec<_>>()
-                    )?
+            print_entries(entries, json)?;
+        }
+        Command::Find { terms, json } => {
+            let vault = Vault::open(&dir, false)?;
+            let entries = vault.search(&terms);
+            if entries.is_empty() && !json {
+                eprintln!(
+                    "no entry matches {terms:?}; try fewer keywords, `jinnang ls`, or ask the user (jinnang need)"
                 );
-            } else {
-                for e in entries {
-                    println!(
-                        "{:<40} {:<11} v{:<4} {}",
-                        e.entry_ref.to_string(),
-                        e.ty.as_str(),
-                        e.current,
-                        labels_str(&e.labels)
-                    );
-                }
             }
+            print_entries(entries, json)?;
         }
         Command::Inspect { target, json } => {
             let (r, s) = target.parse()?;
@@ -368,6 +411,9 @@ fn run(cli: Cli) -> Result<()> {
                 println!("id       {}", e.id);
                 println!("type     {}", e.ty.as_str());
                 println!("labels   {}", labels_str(&e.labels));
+                if let Some(d) = &e.description {
+                    println!("desc     {d}");
+                }
                 println!("version  v{} (updated {})", e.current, e.updated_at);
                 println!("fields");
                 for (k, v) in &e.public {
@@ -404,6 +450,21 @@ fn run(cli: Cli) -> Result<()> {
             let keys = vault.unlock(&input::passphrase("Vault passphrase: ")?)?;
             let labels = vault.relabel(&keys, &entry, set, &remove)?;
             println!("{entry} labels: {}", labels_str(&labels));
+        }
+        Command::Describe {
+            reference,
+            description,
+            clear,
+        } => {
+            let entry = Reference::parse_entry(&reference)?;
+            let mut vault = Vault::open(&dir, true)?;
+            ensure!(vault.find(&entry).is_some(), "{entry} does not exist");
+            let keys = vault.unlock(&input::passphrase("Vault passphrase: ")?)?;
+            vault.describe(&keys, &entry, if clear { None } else { description })?;
+            println!(
+                "{entry} description {}",
+                if clear { "cleared" } else { "updated" }
+            );
         }
         Command::Mv { from, to } => {
             let (from, to) = (Reference::parse_entry(&from)?, Reference::parse_entry(&to)?);
@@ -537,6 +598,7 @@ fn store(
         fields,
         write.public,
         parse_labels(&write.labels)?,
+        write.desc,
         write.pending,
         rotate,
     )
@@ -550,6 +612,7 @@ fn submit(
     fields: Fields,
     public: Vec<String>,
     labels: Labels,
+    description: Option<String>,
     pending_only: bool,
     rotate: bool,
 ) -> Result<()> {
@@ -560,6 +623,7 @@ fn submit(
         fields,
         public.into_iter().collect(),
         labels,
+        description,
         rotate,
     )?;
     let passphrase = if pending_only {
@@ -642,12 +706,35 @@ fn labels_str(labels: &Labels) -> String {
         .join(",")
 }
 
+fn print_entries(mut entries: Vec<&EntryRecord>, json: bool) -> Result<()> {
+    entries.sort_by(|a, b| a.entry_ref.cmp(&b.entry_ref));
+    if json {
+        let list: Vec<_> = entries.iter().map(|e| entry_json(e)).collect();
+        println!("{}", serde_json::to_string_pretty(&list)?);
+        return Ok(());
+    }
+    for e in entries {
+        println!(
+            "{:<40} {:<11} v{:<4} {}",
+            e.entry_ref.to_string(),
+            e.ty.as_str(),
+            e.current,
+            labels_str(&e.labels)
+        );
+        if let Some(d) = &e.description {
+            println!("    {d}");
+        }
+    }
+    Ok(())
+}
+
 fn entry_json(e: &EntryRecord) -> serde_json::Value {
     json!({
         "ref": e.entry_ref.to_string(),
         "id": e.id,
         "type": e.ty,
         "labels": e.labels,
+        "description": e.description,
         "version": e.current,
         "updated_at": e.updated_at,
         "public": e.public,
