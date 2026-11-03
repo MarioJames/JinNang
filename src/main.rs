@@ -455,6 +455,7 @@ fn run(cli: Cli) -> Result<()> {
                     Some(p) => {
                         vault.unlock(&p).context("sealed passphrase no longer unlocks this vault; run `jinnang unlock enroll`")?;
                         println!("enrolled: {} unseals and unlocks the vault", file.display());
+                        println!("sealed with: {}", jinnang::seal::binding(&dir)?);
                     }
                 }
             }

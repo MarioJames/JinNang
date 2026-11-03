@@ -138,6 +138,24 @@ fn seal_file(file: &Path, passphrase: &SecretString) -> Result<()> {
     Ok(())
 }
 
+/// Which keys protect the sealed passphrase, read from the credential header
+/// (the first 16 bytes name systemd's sealing scheme).
+pub fn binding(dir: &Path) -> Result<&'static str> {
+    let raw = fs::read(path(dir)?)?;
+    let raw: Vec<u8> = raw
+        .into_iter()
+        .filter(|b| !b.is_ascii_whitespace())
+        .collect();
+    let bytes = data_encoding::BASE64
+        .decode(&raw)
+        .context("sealed passphrase is not a systemd credential")?;
+    Ok(match bytes.get(..16).map(hex::encode).as_deref() {
+        Some("55b9ed1d38594d43a8319d2ebb332ac6") => "host key (user-scoped)",
+        Some("ef4ac13679a9480ea7db68897f9f165d") => "host key + TPM2 (user-scoped)",
+        _ => "unknown",
+    })
+}
+
 /// Removes the sealed passphrase; returns whether one existed.
 pub fn remove(dir: &Path) -> Result<bool> {
     match fs::remove_file(path(dir)?) {
