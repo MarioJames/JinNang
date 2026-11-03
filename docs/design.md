@@ -124,6 +124,7 @@ $XDG_STATE_HOME/jinnang/<hash>.json  信任状态：钉住的 vault_id、签名�
 - **M1 存储与录入（已完成）**：
   - 命令：`init`、`set`、`rotate`、`import-env`、`need`、`pending`、`ls`、`inspect`、`label`、`mv`、`rm`、`verify`、`backup`、`restore`；
   - 机制：pending 到激活、签名清单、回滚检测、恢复与换密钥。
+- **L1 出口 `jinnang run`（已完成）**：按字段注入 env、stdin 或私有临时文件（`{NAME}` 参数替换，结束即删）；对子进程输出做流式脱敏；每次使用在 `audit.jsonl` 记录 start/end（不含值，argv 中出现的值同样脱敏）。
 - **M2 追溯闭环与 SSH**：
   - 独立 UID 的 broker、systemd 加密凭证解锁；
   - 策略：auto/notify/strict 加预授权；

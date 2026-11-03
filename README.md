@@ -4,7 +4,7 @@ Jinnang 是一个面向 AI agent 的本地凭证库。agent 只持有 `jn://` �
 
 名字取自「锦囊妙计」：锦囊密封交付，持有人事先不知道内容，到了约定的时机、按约定的用途才能拆开。
 
-> 状态：**M1（加密存储与录入）**。agent 侧的申请、兑换、注入，SSH 会话托管和审计在 M2 实现，见 [设计文档](docs/design.md)。
+> 状态：**M1（加密存储与录入）+ L1 出口 `jinnang run`**。独立 UID broker、按策略签发的一次性授权、SSH 会话托管和防篡改审计在 M2 实现，见 [设计文档](docs/design.md)。
 
 ## 它解决什么
 
@@ -49,6 +49,13 @@ jinnang ls
 jinnang ls -l 'env=prod,team in (platform,data)'
 jinnang inspect jn://acme/app-db --json
 
+# 使用（L1）：把字段注入命令；输出里出现的值会被替换为 [jinnang:redacted]，每次使用写入 audit.jsonl
+jinnang run jn://acme/app-db --env PGPASSWORD=password -- psql -h db.internal -U app_rw app
+jinnang run -l env=prod,team=platform --env PGPASSWORD=password -- psql ...   # 选择器必须恰好命中一个条目
+jinnang run jn://acme/deploy-key --file KEY=private_key -- ssh -i {KEY} -o IdentitiesOnly=yes root@host true
+jinnang run jn://acme/app-env --env-file CREDS -- ./deploy.sh --credentials {CREDS}
+jinnang run jn://acme/token --stdin token -- mycli login --token-stdin
+
 # 整理：改标签（key- 删除）、改名；都不产生新版本
 jinnang label jn://acme/app-db owner=alice team-
 jinnang mv jn://acme/app-db jn://acme/prod/app-db
@@ -83,10 +90,10 @@ jinnang set jn://bank/otp --type totp
 # 团队：同一 SaaS 租户下的多个账号，靠标签区分和挑选
 jinnang set jn://work/poc/sales --type account -l env=prod -l tenant=poc -l role=sales -l pool=poc-qa
 jinnang set jn://work/poc/owner --type account -l env=prod -l tenant=poc -l role=owner
-jinnang inspect -l tenant=poc,role=sales
+jinnang run -l tenant=poc,role=sales --env PW=password -- ./login.sh
 ```
 
-选择器语法与 Kubernetes 相同：`k=v`、`k!=v`、`k`、`!k`、`k in (a,b)`、`k notin (a,b)`，逗号表示「且」。在 `inspect` 等需要单个条目的命令中使用时必须恰好命中一个条目，命中零个或多个都会报错，不会替你挑一个。
+选择器语法与 Kubernetes 相同：`k=v`、`k!=v`、`k`、`!k`、`k in (a,b)`、`k notin (a,b)`，逗号表示「且」。在 `run`、`inspect` 中使用时必须恰好命中一个条目，命中零个或多个都会报错，不会替你挑一个。
 
 条目类型（内置类型是字段模板；任何类型都可以用 `--field` 或 `--stdin-json` 加自定义字段，自定义字段默认是秘密，用 `--public` 标为公开）：
 

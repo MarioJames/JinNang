@@ -10,6 +10,7 @@ use serde_json::json;
 use jinnang::crypto::{self, KeyMaterial};
 use jinnang::input;
 use jinnang::refs::{EntryRef, Reference};
+use jinnang::run;
 use jinnang::schema::{EntryType, Fields};
 use jinnang::selector::{self, Labels, Selector};
 use jinnang::store::{EntryRecord, PendingMeta, Vault};
@@ -128,6 +129,33 @@ enum Command {
     },
     /// Rename an entry
     Mv { from: String, to: String },
+    /// Run a command with fields of one entry injected (L1: prevents accidental exposure)
+    ///
+    /// Example: jinnang run jn://acme/db --env PGPASSWORD=password -- psql -h db -U app
+    Run {
+        #[command(flatten)]
+        target: Target,
+        /// NAME=FIELD environment variable (repeatable)
+        #[arg(long = "env", value_name = "NAME=FIELD")]
+        env: Vec<String>,
+        /// Export every field (env_bundle/generic keys as-is, others as JN_<FIELD>)
+        #[arg(long)]
+        all_env: bool,
+        /// Write this field to the command's stdin
+        #[arg(long, value_name = "FIELD")]
+        stdin: Option<String>,
+        /// NAME=FIELD: write the field to a private file; $NAME and the argument {NAME} become its path
+        #[arg(long = "file", value_name = "NAME=FIELD")]
+        files: Vec<String>,
+        /// NAME: write all fields as a dotenv file; $NAME and the argument {NAME} become its path
+        #[arg(long = "env-file", value_name = "NAME")]
+        env_files: Vec<String>,
+        /// Pass output through unchanged (needed for interactive programs)
+        #[arg(long)]
+        no_redact: bool,
+        #[arg(required = true, allow_hyphen_values = true, last = true)]
+        command: Vec<String>,
+    },
     /// Delete an entry (tombstone; stored versions remain for recovery)
     Rm { reference: String },
     /// Verify signatures, digests and trust state; --deep also decrypts every version
@@ -384,6 +412,35 @@ fn run(cli: Cli) -> Result<()> {
             let keys = vault.unlock(&input::passphrase("Vault passphrase: ")?)?;
             vault.rename(&keys, &from, &to)?;
             println!("renamed {from} -> {to}");
+        }
+        Command::Run {
+            target,
+            env,
+            all_env,
+            stdin,
+            files,
+            env_files,
+            no_redact,
+            command,
+        } => {
+            let (r, s) = target.parse()?;
+            let spec = run::RunSpec {
+                env: env
+                    .iter()
+                    .map(|m| run::parse_mapping(m))
+                    .collect::<Result<_>>()?,
+                all_env,
+                stdin,
+                files: files
+                    .iter()
+                    .map(|m| run::parse_mapping(m))
+                    .collect::<Result<_>>()?,
+                env_files,
+                redact: !no_redact,
+            };
+            let passphrase = input::passphrase("Vault passphrase: ")?;
+            let code = run::run(&dir, r.as_ref(), s.as_ref(), &spec, &command, &passphrase)?;
+            std::process::exit(code);
         }
         Command::Rm { reference } => {
             let entry = Reference::parse_entry(&reference)?;

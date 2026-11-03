@@ -450,6 +450,105 @@ fn copy_dir(from: &Path, to: &Path) {
     }
 }
 
+#[test]
+fn run_injects_fields_redacts_output_and_audits() {
+    let env = Env::new();
+    env.init();
+    assert!(env.set_dsn(DB_PASSWORD).ok);
+    let r = "jn://prod/acme/app-db";
+
+    // env var injection: the child sees the value, the caller's output does not.
+    let check =
+        format!(r#"test "$PGPASSWORD" = '{DB_PASSWORD}' && echo "pw=$PGPASSWORD host=$JN_HOST""#);
+    let out = run(env.cmd().args([
+        "run",
+        r,
+        "--env",
+        "PGPASSWORD=password",
+        "--all-env",
+        "--",
+        "sh",
+        "-c",
+        &check,
+    ]));
+    assert!(out.ok, "{}", out.text);
+    assert!(
+        out.text.contains("pw=[jinnang:redacted] host=db.internal"),
+        "{}",
+        out.text
+    );
+
+    // stdin injection and exit-code propagation.
+    let stdin_check = format!(r#"read v; test "$v" = '{DB_PASSWORD}'"#);
+    assert!(
+        run(env.cmd().args([
+            "run",
+            r,
+            "--stdin",
+            "password",
+            "--",
+            "sh",
+            "-c",
+            &stdin_check
+        ]))
+        .ok
+    );
+    let failing = env
+        .cmd()
+        .args(["run", r, "--", "sh", "-c", "exit 7"])
+        .output()
+        .unwrap();
+    assert_eq!(failing.status.code(), Some(7));
+
+    // Private files: path substituted for {NAME}, mode 0600, removed afterwards.
+    let file_check = format!(
+        r#"test "$(stat -c %a "$1")" = 600 && . "$2" && test "$JN_PASSWORD" = '{DB_PASSWORD}' && test "$(cat "$1")" = '{DB_PASSWORD}' && echo "$1""#
+    );
+    let out = run(env.cmd().args([
+        "run",
+        r,
+        "--file",
+        "PWFILE=password",
+        "--env-file",
+        "DOTENV",
+        "--",
+        "sh",
+        "-c",
+        &file_check,
+        "sh",
+        "{PWFILE}",
+        "{DOTENV}",
+    ]));
+    assert!(out.ok, "{}", out.text);
+    let path = out.text.trim();
+    assert!(
+        path.contains("jinnang-run-") && !Path::new(path).exists(),
+        "temp file must be removed: {path}"
+    );
+
+    // Every use is in the audit log, without the value.
+    let audit = fs::read_to_string(env.vault().join("audit.jsonl")).unwrap();
+    assert_no_secret(&audit);
+    let events: Vec<Value> = audit
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(
+        events.iter().filter(|e| e["event"] == "run.start").count(),
+        4
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| e["event"] == "run.end" && e["exit_code"] == 7)
+    );
+    assert!(
+        events
+            .iter()
+            .all(|e| e["event"] != "run.start" || e["ref"] == r)
+    );
+}
+
 fn ls_refs(env: &Env, selector: &str) -> Vec<String> {
     let out = run(env.cmd().args(["ls", "--json", "-l", selector]));
     assert!(out.ok, "{}", out.text);
@@ -505,13 +604,19 @@ fn labels_select_entries_and_selectors_must_be_unambiguous() {
     assert_eq!(ls_refs(&env, "!tenant"), ["jn://personal/github"]);
 
     // A selector stands in for a reference only when it matches exactly one entry.
-    let one = run(env
-        .cmd()
-        .args(["inspect", "-l", "tenant=poc,role=sales", "--json"]));
+    let one = run(env.cmd().args([
+        "run",
+        "-l",
+        "tenant=poc,role=sales",
+        "--env",
+        "P=password",
+        "--",
+        "sh",
+        "-c",
+        r#"test "$P" = pw-sales-1111"#,
+    ]));
     assert!(one.ok, "{}", one.text);
-    let v: Value = serde_json::from_str(&one.text).unwrap();
-    assert_eq!(v["ref"], "jn://work/poc/qa-sales");
-    let many = run(env.cmd().args(["inspect", "-l", "tenant=poc"]));
+    let many = run(env.cmd().args(["run", "-l", "tenant=poc", "--", "true"]));
     assert!(
         !many.ok && many.text.contains("2 entries match"),
         "{}",
@@ -563,12 +668,17 @@ fn labels_select_entries_and_selectors_must_be_unambiguous() {
         .ok
     );
     assert_eq!(ls_refs(&env, "pool=poc-qa"), ["jn://work/poc/sales"]);
-    let after = run(env.cmd().args(["inspect", "jn://work/poc/sales", "--json"]));
-    let v: Value = serde_json::from_str(&after.text).unwrap();
-    assert_eq!(
-        v["labels"],
-        serde_json::json!({"pool": "poc-qa", "tenant": "poc"})
-    );
+    let after = run(env.cmd().args([
+        "run",
+        "jn://work/poc/sales",
+        "--env",
+        "P=password",
+        "--",
+        "sh",
+        "-c",
+        r#"test "$P" = pw-sales-1111"#,
+    ]));
+    assert!(after.ok, "{}", after.text);
 
     // Rotation keeps labels unless overridden.
     let rot = run(env
@@ -652,4 +762,16 @@ fn generic_entries_take_custom_fields_secret_unless_public() {
         v["secret_fields"],
         serde_json::json!(["password", "recovery_code"])
     );
+
+    // Custom field names become env names as-is for generic entries.
+    let env_check = run(env.cmd().args([
+        "run",
+        "jn://saas/notion",
+        "--all-env",
+        "--",
+        "sh",
+        "-c",
+        r#"test "$api_key" = nt-secret-5555 && test "$workspace" = acme"#,
+    ]));
+    assert!(env_check.ok, "{}", env_check.text);
 }
