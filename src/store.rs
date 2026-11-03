@@ -197,10 +197,15 @@ fn state_base() -> Result<PathBuf> {
 }
 
 fn state_path(dir: &Path) -> Result<PathBuf> {
+    state_file(dir, "json")
+}
+
+/// Per-vault file in the state directory, keyed by the canonical vault path.
+pub fn state_file(dir: &Path, extension: &str) -> Result<PathBuf> {
     let canonical = fs::canonicalize(dir)?;
     let digest = crypto::sha256(canonical.as_os_str().as_encoded_bytes());
     Ok(state_base()?.join(format!(
-        "{}.json",
+        "{}.{extension}",
         &digest["sha256:".len().."sha256:".len() + 24]
     )))
 }

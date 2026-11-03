@@ -923,3 +923,83 @@ fn agents_discover_entries_by_keywords_and_descriptions() {
         assert!(!out.contains("pw-"), "{out}");
     }
 }
+
+fn user_creds_available() -> bool {
+    let dir = TempDir::new().unwrap();
+    std::process::Command::new("systemd-creds")
+        .args(["--user", "--name", "jinnang-probe", "encrypt", "-"])
+        .arg(dir.path().join("probe.cred"))
+        .stdin(std::process::Stdio::null())
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+#[test]
+fn enrolled_vault_unlocks_without_any_passphrase_from_the_caller() {
+    if !user_creds_available() {
+        eprintln!("skipped: user-scoped systemd-creds unavailable");
+        return;
+    }
+    let env = Env::new();
+    env.init();
+    assert!(env.set_dsn(DB_PASSWORD).ok);
+    let locked = |args: &[&str]| run(env.cmd_at(&env.vault(), None).args(args));
+    let check = format!(r#"test "$P" = '{DB_PASSWORD}'"#);
+    let use_it = [
+        "run",
+        "jn://prod/acme/app-db",
+        "--env",
+        "P=password",
+        "--",
+        "sh",
+        "-c",
+        &check,
+    ];
+
+    let before = locked(&use_it);
+    assert!(
+        !before.ok && before.text.contains("jinnang unlock enroll"),
+        "{}",
+        before.text
+    );
+    assert!(locked(&["unlock", "status"]).text.contains("not enrolled"));
+
+    // A wrong passphrase is never sealed.
+    fs::write(env.path("wrong"), "not the passphrase at all\n").unwrap();
+    let wrong = run(env
+        .cmd_at(&env.vault(), Some("wrong"))
+        .args(["unlock", "enroll"]));
+    assert!(
+        !wrong.ok && wrong.text.contains("wrong passphrase"),
+        "{}",
+        wrong.text
+    );
+
+    let enroll = run(env.cmd().args(["unlock", "enroll"]));
+    assert!(enroll.ok, "{}", enroll.text);
+    let sealed = fs::read(
+        fs::read_dir(env.path("state"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.to_string_lossy().ends_with(".passphrase.cred"))
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(!String::from_utf8_lossy(&sealed).contains(PASS));
+
+    // The caller passes nothing; jinnang unseals the passphrase itself.
+    let after = locked(&use_it);
+    assert!(after.ok, "{}", after.text);
+    assert!(
+        locked(&["unlock", "status"])
+            .text
+            .contains("unseals and unlocks")
+    );
+    assert!(locked(&["verify", "--deep"]).ok);
+    for out in [&enroll.text, &after.text] {
+        assert_no_secret(out);
+    }
+
+    assert!(locked(&["unlock", "remove"]).ok);
+    assert!(!locked(&use_it).ok);
+}

@@ -37,12 +37,28 @@ fn passphrase_from_file() -> Result<Option<SecretString>> {
     Ok(Some(SecretString::from(raw.to_string())))
 }
 
-/// Passphrase from `JINNANG_PASSPHRASE_FILE` (e.g. a systemd credential) or the
-/// controlling terminal. `None` when neither is available.
-pub fn try_passphrase(prompt: &str) -> Result<Option<SecretString>> {
+/// Passphrase for the vault at `dir`, from (in order) `JINNANG_PASSPHRASE_FILE`, the
+/// passphrase sealed by `jinnang unlock enroll`, or the controlling terminal.
+/// `None` when none is available. Callers never pass the passphrase themselves.
+pub fn try_passphrase(dir: &Path, prompt: &str) -> Result<Option<SecretString>> {
     if let Some(p) = passphrase_from_file()? {
         return Ok(Some(p));
     }
+    if let Some(p) = crate::seal::load(dir)? {
+        return Ok(Some(p));
+    }
+    typed_passphrase(prompt)
+}
+
+/// Passphrase typed by a human (or `JINNANG_PASSPHRASE_FILE`), never the sealed one.
+pub fn human_passphrase(prompt: &str) -> Result<SecretString> {
+    if let Some(p) = passphrase_from_file()? {
+        return Ok(p);
+    }
+    typed_passphrase(prompt)?.context("no terminal to read the passphrase")
+}
+
+fn typed_passphrase(prompt: &str) -> Result<Option<SecretString>> {
     if tty().is_none() {
         return Ok(None);
     }
@@ -51,10 +67,11 @@ pub fn try_passphrase(prompt: &str) -> Result<Option<SecretString>> {
     Ok(Some(SecretString::from(p.to_string())))
 }
 
-pub fn passphrase(prompt: &str) -> Result<SecretString> {
-    try_passphrase(prompt)?.with_context(|| {
-        format!("no passphrase source: run in a terminal or set {PASSPHRASE_FILE_ENV}")
-    })
+pub fn passphrase(dir: &Path, prompt: &str) -> Result<SecretString> {
+    try_passphrase(dir, prompt)?.context(
+        "vault is locked: no sealed passphrase and no terminal. The user enables unattended \
+         use once with `jinnang unlock enroll` in their own terminal",
+    )
 }
 
 pub fn new_passphrase() -> Result<SecretString> {

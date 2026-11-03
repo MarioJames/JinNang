@@ -5,6 +5,7 @@ pub mod input;
 pub mod refs;
 pub mod run;
 pub mod schema;
+pub mod seal;
 pub mod selector;
 pub mod store;
 

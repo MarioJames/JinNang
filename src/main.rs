@@ -117,6 +117,11 @@ enum Command {
         #[arg(long)]
         reason: Option<String>,
     },
+    /// Let jinnang unlock the vault by itself (passphrase sealed with systemd-creds)
+    Unlock {
+        #[command(subcommand)]
+        action: UnlockAction,
+    },
     /// Manage candidates written without the passphrase
     Pending {
         #[command(subcommand)]
@@ -235,6 +240,16 @@ struct WriteOpts {
     /// Only write a pending candidate; do not ask for the passphrase
     #[arg(long)]
     pending: bool,
+}
+
+#[derive(Subcommand)]
+enum UnlockAction {
+    /// Type the passphrase once; it is verified and sealed for unattended use
+    Enroll,
+    /// Show whether a sealed passphrase exists and still unlocks the vault
+    Status,
+    /// Delete the sealed passphrase (commands prompt on a terminal again)
+    Remove,
 }
 
 #[derive(Subcommand)]
@@ -381,6 +396,42 @@ fn run(cli: Cli) -> Result<()> {
             println!("Do not ask the user to paste the value into the conversation.");
         }
         Command::Pending { action } => pending(&dir, action)?,
+        Command::Unlock { action } => match action {
+            UnlockAction::Enroll => {
+                let vault = Vault::open(&dir, false)?;
+                let passphrase = input::human_passphrase("Vault passphrase: ")?;
+                vault.unlock(&passphrase)?;
+                let file = jinnang::seal::enroll(&dir, &passphrase)?;
+                println!(
+                    "passphrase sealed to this machine and user at {}; jinnang now unlocks without prompting",
+                    file.display()
+                );
+            }
+            UnlockAction::Status => {
+                let vault = Vault::open(&dir, false)?;
+                let file = jinnang::seal::path(&dir)?;
+                match jinnang::seal::load(&dir)? {
+                    None => println!(
+                        "not enrolled: commands that decrypt need a terminal (run `jinnang unlock enroll`)"
+                    ),
+                    Some(p) => {
+                        vault.unlock(&p).context("sealed passphrase no longer unlocks this vault; run `jinnang unlock enroll`")?;
+                        println!("enrolled: {} unseals and unlocks the vault", file.display());
+                    }
+                }
+            }
+            UnlockAction::Remove => {
+                let removed = jinnang::seal::remove(&dir)?;
+                println!(
+                    "{}",
+                    if removed {
+                        "sealed passphrase removed"
+                    } else {
+                        "nothing to remove"
+                    }
+                );
+            }
+        },
         Command::Ls { selector, json } => {
             let selector = selector.as_deref().map(Selector::parse).transpose()?;
             let vault = Vault::open(&dir, false)?;
@@ -447,7 +498,7 @@ fn run(cli: Cli) -> Result<()> {
             }
             let mut vault = Vault::open(&dir, true)?;
             ensure!(vault.find(&entry).is_some(), "{entry} does not exist");
-            let keys = vault.unlock(&input::passphrase("Vault passphrase: ")?)?;
+            let keys = vault.unlock(&input::passphrase(&dir, "Vault passphrase: ")?)?;
             let labels = vault.relabel(&keys, &entry, set, &remove)?;
             println!("{entry} labels: {}", labels_str(&labels));
         }
@@ -459,7 +510,7 @@ fn run(cli: Cli) -> Result<()> {
             let entry = Reference::parse_entry(&reference)?;
             let mut vault = Vault::open(&dir, true)?;
             ensure!(vault.find(&entry).is_some(), "{entry} does not exist");
-            let keys = vault.unlock(&input::passphrase("Vault passphrase: ")?)?;
+            let keys = vault.unlock(&input::passphrase(&dir, "Vault passphrase: ")?)?;
             vault.describe(&keys, &entry, if clear { None } else { description })?;
             println!(
                 "{entry} description {}",
@@ -470,7 +521,7 @@ fn run(cli: Cli) -> Result<()> {
             let (from, to) = (Reference::parse_entry(&from)?, Reference::parse_entry(&to)?);
             let mut vault = Vault::open(&dir, true)?;
             ensure!(vault.find(&from).is_some(), "{from} does not exist");
-            let keys = vault.unlock(&input::passphrase("Vault passphrase: ")?)?;
+            let keys = vault.unlock(&input::passphrase(&dir, "Vault passphrase: ")?)?;
             vault.rename(&keys, &from, &to)?;
             println!("renamed {from} -> {to}");
         }
@@ -499,7 +550,7 @@ fn run(cli: Cli) -> Result<()> {
                 env_files,
                 redact: !no_redact,
             };
-            let passphrase = input::passphrase("Vault passphrase: ")?;
+            let passphrase = input::passphrase(&dir, "Vault passphrase: ")?;
             let code = run::run(&dir, r.as_ref(), s.as_ref(), &spec, &command, &passphrase)?;
             std::process::exit(code);
         }
@@ -507,14 +558,14 @@ fn run(cli: Cli) -> Result<()> {
             let entry = Reference::parse_entry(&reference)?;
             let mut vault = Vault::open(&dir, true)?;
             ensure!(vault.find(&entry).is_some(), "{entry} does not exist");
-            let keys = vault.unlock(&input::passphrase("Vault passphrase: ")?)?;
+            let keys = vault.unlock(&input::passphrase(&dir, "Vault passphrase: ")?)?;
             vault.remove(&keys, &entry)?;
             println!("removed {entry}");
         }
         Command::Verify { deep } => {
             let vault = Vault::open(&dir, false)?;
             let keys = if deep {
-                Some(vault.unlock(&input::passphrase("Vault passphrase: ")?)?)
+                Some(vault.unlock(&input::passphrase(&dir, "Vault passphrase: ")?)?)
             } else {
                 None
             };
@@ -629,7 +680,7 @@ fn submit(
     let passphrase = if pending_only {
         None
     } else {
-        input::try_passphrase("Vault passphrase (to activate): ")?
+        input::try_passphrase(dir, "Vault passphrase (to activate): ")?
     };
     let Some(passphrase) = passphrase else {
         println!(
@@ -662,7 +713,7 @@ fn pending(dir: &Path, action: PendingAction) -> Result<()> {
                 ids
             };
             ensure!(!ids.is_empty(), "nothing to activate");
-            let keys = vault.unlock(&input::passphrase("Vault passphrase: ")?)?;
+            let keys = vault.unlock(&input::passphrase(dir, "Vault passphrase: ")?)?;
             let mut failed = 0;
             for id in ids {
                 match vault.activate(&keys, &id) {

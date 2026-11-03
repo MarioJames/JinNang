@@ -74,6 +74,10 @@ jinnang mv jn://acme/app-db jn://acme/prod/app-db
 jinnang rotate jn://acme/prod/app-db              # 标签沿用，-l 可覆盖
 jinnang rm jn://acme/prod/app-db
 
+# 免交互解锁：输入一次口令，校验后用 systemd 用户级加密凭证封存；之后 jinnang 自行解封，调用方（agent）不传口令
+jinnang unlock enroll
+jinnang unlock status
+
 # 不解锁的写入先进入 pending，之后由用户激活
 jinnang set jn://acme/token --type api_token --stdin-json --pending < values.json
 jinnang pending ls
@@ -125,7 +129,7 @@ jinnang run -l tenant=poc,role=sales --env PW=password -- ./login.sh
 | 变量 | 作用 |
 | --- | --- |
 | `JINNANG_VAULT` | vault 目录，默认 `$XDG_DATA_HOME/jinnang/vault` |
-| `JINNANG_PASSPHRASE_FILE` | 从文件读取口令，例如 systemd 加密凭证解出的文件；未设置时从终端读取 |
+| `JINNANG_PASSPHRASE_FILE` | 从文件读取口令，供测试和 CI 使用；日常用 `jinnang unlock enroll` 封存口令，未封存时从终端读取 |
 | `JINNANG_STATE_DIR` | 信任状态目录，记录钉住的签名公钥和最高清单序号；默认 `$XDG_STATE_HOME/jinnang` |
 
 ## 给 Agent 用
@@ -154,7 +158,7 @@ ln -s ~/.agents/skills/jinnang ~/.claude/skills/jinnang  # Claude Code
   - 篡改、换位、改清单都会被发现；
   - 输出与错误信息不含秘密值。
 - 不能保证：
-  - **M1 没有进程隔离**，vault 目录与 agent 同属一个用户。
+  - **M1 没有进程隔离**，vault 目录与 agent 同属一个用户。`unlock enroll` 封存的口令绑定本机和当前用户，磁盘上不再有明文口令，但同一用户的进程仍能请 systemd 解封它；真正把 agent 挡在口令之外需要 M2 的独立 UID broker。
   - **整盘快照回滚无法检测**：纯本地模式只能发现「vault 目录回滚而信任状态没回滚」的情况，要发现整盘回滚，需要把清单序号外部锚定。
   - **已经泄露的凭证必须在源系统轮换**：撤销设备不会让旧备份失效。
 

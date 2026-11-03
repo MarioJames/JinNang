@@ -14,7 +14,8 @@ Jinnang 是本机的凭证库。你只持有 `jn://` 引用，由 `jinnang` 把�
 - 只用引用。不 `cat`、`grep`、`source` 凭证文件或 `.env`，不把值打印、写入文件、记忆、报告、提交或对话。旧记忆里提到的明文文件路径，先用 `jinnang find` 找对应条目。
 - 不猜账号。找不到或有多个候选时，先按下文缩小范围；仍不确定就问用户，不换一个「看起来差不多」的账号。
 - 缺凭证时运行 `jinnang need`，把它打印的命令交给用户在自己的终端执行；不要让用户把值粘贴进对话。
-- 不绕过工具：不读取 vault 目录、口令文件或恢复包，不用 `--no-redact` 输出秘密，不把注入的值 `echo` 出来。
+- 口令不归你管：`jinnang` 自己解封口令，你不传、不找、不设置任何口令或口令文件。
+- 不绕过工具：不读取 vault 目录、封存的口令或恢复包，不调用 `systemd-creds` 解密，不用 `--no-redact` 输出秘密，不把注入的值 `echo` 出来。
 - 疑似泄露时停下，报告引用，由用户在源系统轮换。
 
 ## 找到要用的账号
@@ -102,14 +103,15 @@ openssl rand -base64 32 | tr -d '\n' | jq -Rs '{password: .}' | \
 ```
 
 - 给每个条目写 `--desc`：一句话说明系统、租户、角色和用途，让以后的 agent 能用 `jinnang find` 找到它；条目已存在时用 `jinnang describe <ref> '<说明>'` 补写，用 `jinnang label <ref> k=v` 补标签。
-- 没有口令时写入会成为 pending 候选，告诉用户运行 `jinnang pending activate <id>`。
+- vault 处于锁定状态时写入会成为 pending 候选，告诉用户运行 `jinnang pending activate <id>`。
 - 已有条目换新值用 `jinnang rotate`，不要删了重建。
 
 ## 出错时
 
 | 现象 | 处理 |
 | --- | --- |
-| `no terminal to read the passphrase` 或口令错误 | 当前环境拿不到口令；告诉用户，不去找口令文件 |
+| `vault is locked` | 用户还没开启免交互解锁；请用户在自己的终端运行一次 `jinnang unlock enroll`，你不要代为输入或寻找口令 |
+| `cannot unseal` / `wrong passphrase` | 封存的口令失效（换过口令或机器）；请用户重新 `jinnang unlock enroll` |
 | `N entries match the selector` | 加条件或改用完整引用 |
 | `no entry matches` / `does not exist` | 换关键词 `jinnang find`；仍没有就 `jinnang need` |
 | `vault identity ... changed` / `rollback detected` | vault 可能被替换或回滚；停下报告用户，不要删除信任状态 |

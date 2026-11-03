@@ -121,6 +121,7 @@ $XDG_STATE_HOME/jinnang/<hash>.json  信任状态：钉住的 vault_id、签名�
 
 ## 6. 里程碑
 
+- **免交互解锁（已完成）**：`jinnang unlock enroll` 校验口令后用 `systemd-creds --user`（本机凭证密钥，可叠加 TPM2）封存到信任状态目录；解锁顺序为 `JINNANG_PASSPHRASE_FILE`（测试/CI）→ 封存口令 → 终端。调用方不传口令。M1 中同一用户仍可自行解封，M2 改由 broker 的独立 UID 持有该凭证。
 - **M1 存储与录入（已完成）**：
   - 命令：`init`、`set`、`rotate`、`import-env`、`need`、`pending`、`ls`、`inspect`、`label`、`mv`、`rm`、`verify`、`backup`、`restore`；
   - 机制：pending 到激活、签名清单、回滚检测、恢复与换密钥。
