@@ -43,7 +43,7 @@ cargo install --path .
 ## 使用
 
 ```sh
-# 创建 vault，口令至少 12 个字符；恢复包请转移到离线位置
+# 创建 vault，口令至少 12 个字符（或 --self-held 由 jinnang 自持口令）；恢复包请转移到离线位置
 jinnang init --recovery-kit ~/jinnang-recovery.json
 
 # 录入：非秘密字段明文回显，秘密字段不回显；-l 打标签，--desc 写一句用途
@@ -74,9 +74,11 @@ jinnang mv jn://acme/app-db jn://acme/prod/app-db
 jinnang rotate jn://acme/prod/app-db              # 标签沿用，-l 可覆盖
 jinnang rm jn://acme/prod/app-db
 
-# 免交互解锁：输入一次口令，校验后用 systemd 用户级加密凭证封存；之后 jinnang 自行解封，调用方（agent）不传口令
-jinnang unlock enroll
+# 免交互解锁：口令用 systemd 用户级加密凭证封存（本机密钥，有 TPM2 时叠加 TPM2），jinnang 自行解封，调用方（agent）不传口令
+jinnang unlock enroll              # 输入一次现有口令，校验后封存
+jinnang unlock enroll --generate   # 改成 jinnang 生成并自持的 256 位随机口令，不显示、无人知晓
 jinnang unlock status
+# 新建时直接自持口令：jinnang init --self-held --recovery-kit ~/jinnang-recovery.json
 
 # 不解锁的写入先进入 pending，之后由用户激活
 jinnang set jn://acme/token --type api_token --stdin-json --pending < values.json
@@ -158,7 +160,7 @@ ln -s ~/.agents/skills/jinnang ~/.claude/skills/jinnang  # Claude Code
   - 篡改、换位、改清单都会被发现；
   - 输出与错误信息不含秘密值。
 - 不能保证：
-  - **M1 没有进程隔离**，vault 目录与 agent 同属一个用户。`unlock enroll` 封存的口令绑定本机和当前用户，磁盘上不再有明文口令，但同一用户的进程仍能请 systemd 解封它；真正把 agent 挡在口令之外需要 M2 的独立 UID broker。
+  - **M1 没有进程隔离**，vault 目录与 agent 同属一个用户。`unlock enroll` 封存的口令绑定本机和当前用户，磁盘上不再有明文口令；自持口令（`--generate` / `--self-held`）没有人知道，本机凭证密钥丢失（如重装系统）后只能用恢复包恢复。但同一用户的进程仍能请 systemd 解封它；真正把 agent 挡在口令之外需要 M2 的独立 UID broker。
   - **整盘快照回滚无法检测**：纯本地模式只能发现「vault 目录回滚而信任状态没回滚」的情况，要发现整盘回滚，需要把清单序号外部锚定。
   - **已经泄露的凭证必须在源系统轮换**：撤销设备不会让旧备份失效。
 

@@ -185,7 +185,7 @@ fn mkdir_private(path: &Path) -> Result<()> {
         .with_context(|| format!("cannot create {}", path.display()))
 }
 
-fn state_base() -> Result<PathBuf> {
+pub fn state_base() -> Result<PathBuf> {
     if let Some(p) = std::env::var_os("JINNANG_STATE_DIR") {
         return Ok(PathBuf::from(p));
     }
@@ -439,6 +439,11 @@ impl Vault {
             "device key file does not belong to this vault"
         );
         Ok(keys)
+    }
+
+    /// Re-seals the device key under a new passphrase (atomic replace).
+    pub fn change_passphrase(&self, keys: &KeyMaterial, new: &SecretString) -> Result<()> {
+        write_atomic(&self.dir.join(IDENTITY_FILE), &keys.seal(new)?)
     }
 
     /// Checks that a recovery kit belongs to this vault.

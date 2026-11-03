@@ -71,6 +71,10 @@ enum Command {
         /// Where to write the recovery kit (must not exist). Keep it offline.
         #[arg(long)]
         recovery_kit: PathBuf,
+        /// Let jinnang generate and hold a random passphrase (sealed with systemd-creds);
+        /// nobody knows it, the recovery kit is the only way back
+        #[arg(long)]
+        self_held: bool,
     },
     /// Store a new entry (values are prompted on the terminal or read from --stdin-json)
     Set {
@@ -244,8 +248,12 @@ struct WriteOpts {
 
 #[derive(Subcommand)]
 enum UnlockAction {
-    /// Type the passphrase once; it is verified and sealed for unattended use
-    Enroll,
+    /// Seal the passphrase for unattended use (typed once and verified)
+    Enroll {
+        /// Replace the passphrase with a random 256-bit one that only jinnang holds
+        #[arg(long)]
+        generate: bool,
+    },
     /// Show whether a sealed passphrase exists and still unlocks the vault
     Status,
     /// Delete the sealed passphrase (commands prompt on a terminal again)
@@ -307,9 +315,22 @@ fn run(cli: Cli) -> Result<()> {
     };
     let dir = vault_dir(&cli.vault)?;
     match command {
-        Command::Init { recovery_kit } => {
-            let passphrase = input::new_passphrase()?;
+        Command::Init {
+            recovery_kit,
+            self_held,
+        } => {
+            let passphrase = if self_held {
+                jinnang::seal::probe(&jinnang::store::state_base()?)
+                    .context("--self-held needs user-scoped systemd credentials")?;
+                jinnang::seal::generate()?
+            } else {
+                input::new_passphrase()?
+            };
             let meta = Vault::init(&dir, &passphrase, &recovery_kit)?;
+            if self_held {
+                jinnang::seal::enroll(&dir, &passphrase)?;
+                println!("passphrase generated and sealed; nobody knows it, keep the recovery kit");
+            }
             println!("vault {} created at {}", meta.vault_id, dir.display());
             println!(
                 "signing key fingerprint {}",
@@ -397,7 +418,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         Command::Pending { action } => pending(&dir, action)?,
         Command::Unlock { action } => match action {
-            UnlockAction::Enroll => {
+            UnlockAction::Enroll { generate: false } => {
                 let vault = Vault::open(&dir, false)?;
                 let passphrase = input::human_passphrase("Vault passphrase: ")?;
                 vault.unlock(&passphrase)?;
@@ -405,6 +426,23 @@ fn run(cli: Cli) -> Result<()> {
                 println!(
                     "passphrase sealed to this machine and user at {}; jinnang now unlocks without prompting",
                     file.display()
+                );
+            }
+            UnlockAction::Enroll { generate: true } => {
+                let vault = Vault::open(&dir, true)?;
+                let keys = vault.unlock(&input::passphrase(&dir, "Current vault passphrase: ")?)?;
+                let new = jinnang::seal::generate()?;
+                // Seal and verify the new passphrase before the device key changes.
+                let staged = jinnang::seal::stage(&dir, &new)?;
+                vault.change_passphrase(&keys, &new)?;
+                jinnang::seal::commit_staged(&dir, &staged)?;
+                let sealed = jinnang::seal::load(&dir)?.context("sealed passphrase missing")?;
+                vault.unlock(&sealed).context(
+                    "new sealed passphrase does not unlock; restore with the recovery kit",
+                )?;
+                println!(
+                    "passphrase replaced with a random one held only by jinnang (sealed at {}); the old passphrase no longer works",
+                    jinnang::seal::path(&dir)?.display()
                 );
             }
             UnlockAction::Status => {

@@ -1000,6 +1000,75 @@ fn enrolled_vault_unlocks_without_any_passphrase_from_the_caller() {
         assert_no_secret(out);
     }
 
+    // jinnang takes over the passphrase: the human one stops working, unattended use continues.
+    let generate = run(env.cmd().args(["unlock", "enroll", "--generate"]));
+    assert!(generate.ok, "{}", generate.text);
+    assert_no_secret(&generate.text);
+    let old = run(env.cmd().args(["verify", "--deep"]));
+    assert!(
+        !old.ok && old.text.contains("wrong passphrase"),
+        "{}",
+        old.text
+    );
+    assert!(locked(&use_it).ok);
+    assert!(locked(&["verify", "--deep"]).ok);
+    assert!(
+        !fs::read_dir(env.path("state")).unwrap().any(|e| e
+            .unwrap()
+            .path()
+            .to_string_lossy()
+            .ends_with(".cred.new")),
+        "staged credential must be committed"
+    );
+
     assert!(locked(&["unlock", "remove"]).ok);
     assert!(!locked(&use_it).ok);
+}
+
+#[test]
+fn self_held_vault_needs_no_human_passphrase() {
+    if !user_creds_available() {
+        eprintln!("skipped: user-scoped systemd-creds unavailable");
+        return;
+    }
+    let env = Env::new();
+    let init = run(env
+        .cmd_at(&env.vault(), None)
+        .args(["init", "--self-held", "--recovery-kit"])
+        .arg(env.path("kit.json")));
+    assert!(init.ok, "{}", init.text);
+    let set = run(env
+        .cmd_at(&env.vault(), None)
+        .args([
+            "set",
+            "jn://acme/token",
+            "--type",
+            "api_token",
+            "--stdin-json",
+        ])
+        .write_stdin(r#"{"token":"tok-self-held-9999"}"#));
+    assert!(
+        set.ok && set.text.contains("stored jn://acme/token v1"),
+        "{}",
+        set.text
+    );
+    let deep = run(env.cmd_at(&env.vault(), None).args(["verify", "--deep"]));
+    assert!(deep.ok, "{}", deep.text);
+    // The recovery kit still opens everything without the held passphrase.
+    let backup = env.path("b.backup");
+    assert!(
+        run(env
+            .cmd_at(&env.vault(), None)
+            .arg("backup")
+            .arg("--out")
+            .arg(&backup))
+        .ok
+    );
+    let restored = run(env
+        .cmd_at(&env.path("restored"), Some("pass"))
+        .args(["restore", "--rekey", "--from"])
+        .arg(&backup)
+        .arg("--recovery-kit")
+        .arg(env.path("kit.json")));
+    assert!(restored.ok, "{}", restored.text);
 }

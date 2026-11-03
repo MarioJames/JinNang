@@ -110,8 +110,8 @@ openssl rand -base64 32 | tr -d '\n' | jq -Rs '{password: .}' | \
 
 | 现象 | 处理 |
 | --- | --- |
-| `vault is locked` | 用户还没开启免交互解锁；请用户在自己的终端运行一次 `jinnang unlock enroll`，你不要代为输入或寻找口令 |
-| `cannot unseal` / `wrong passphrase` | 封存的口令失效（换过口令或机器）；请用户重新 `jinnang unlock enroll` |
+| `vault is locked` | 还没开启免交互解锁；请用户在自己的终端运行 `jinnang unlock enroll`（或 `--generate` 让 jinnang 自持口令），你不要代为输入或寻找口令 |
+| `cannot unseal` / `wrong passphrase` | 封存的口令失效（换过机器或重装系统）；停下报告用户，由用户用恢复包恢复，不要尝试其他口令 |
 | `N entries match the selector` | 加条件或改用完整引用 |
 | `no entry matches` / `does not exist` | 换关键词 `jinnang find`；仍没有就 `jinnang need` |
 | `vault identity ... changed` / `rollback detected` | vault 可能被替换或回滚；停下报告用户，不要删除信任状态 |

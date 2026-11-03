@@ -41,9 +41,13 @@ pub fn load(dir: &Path) -> Result<Option<SecretString>> {
     if !file.exists() {
         return Ok(None);
     }
+    load_file(&file).map(Some)
+}
+
+fn load_file(file: &Path) -> Result<SecretString> {
     let out = systemd_creds()
         .arg("decrypt")
-        .arg(&file)
+        .arg(file)
         .arg("-")
         .stdin(Stdio::null())
         .stderr(Stdio::piped())
@@ -59,12 +63,50 @@ pub fn load(dir: &Path) -> Result<Option<SecretString>> {
     }
     let text = std::str::from_utf8(&stdout).context("sealed passphrase is not UTF-8")?;
     ensure!(!text.is_empty(), "sealed passphrase is empty");
-    Ok(Some(SecretString::from(text.to_string())))
+    Ok(SecretString::from(text.to_string()))
+}
+
+/// A new 256-bit passphrase that only jinnang holds (it is never displayed).
+pub fn generate() -> Result<SecretString> {
+    let mut bytes = Zeroizing::new([0u8; 32]);
+    getrandom::fill(bytes.as_mut()).map_err(|e| anyhow::anyhow!("no randomness: {e}"))?;
+    Ok(SecretString::from(hex::encode(&bytes[..])))
 }
 
 /// Seals `passphrase` for unattended use of the vault at `dir`.
 pub fn enroll(dir: &Path, passphrase: &SecretString) -> Result<PathBuf> {
     let file = path(dir)?;
+    seal_file(&file, passphrase)?;
+    Ok(file)
+}
+
+/// Seals to a staging file next to the final one and checks that it unseals;
+/// `commit_staged` moves it into place.
+pub fn stage(dir: &Path, passphrase: &SecretString) -> Result<PathBuf> {
+    let staged = path(dir)?.with_extension("cred.new");
+    seal_file(&staged, passphrase)?;
+    ensure!(
+        load_file(&staged)?.expose_secret() == passphrase.expose_secret(),
+        "sealed passphrase does not round-trip"
+    );
+    Ok(staged)
+}
+
+pub fn commit_staged(dir: &Path, staged: &Path) -> Result<()> {
+    fs::rename(staged, path(dir)?)?;
+    Ok(())
+}
+
+/// Fails early when user-scoped systemd credentials are unusable here.
+pub fn probe(state_dir_hint: &Path) -> Result<()> {
+    fs::create_dir_all(state_dir_hint)?;
+    let file = state_dir_hint.join(format!(".probe-{}.cred", std::process::id()));
+    let r = seal_file(&file, &SecretString::from("probe".to_string()));
+    let _ = fs::remove_file(&file);
+    r
+}
+
+fn seal_file(file: &Path, passphrase: &SecretString) -> Result<()> {
     let parent = file.parent().context("state directory")?;
     fs::create_dir_all(parent)?;
     let tmp = parent.join(format!(".{}.tmp", std::process::id()));
@@ -92,8 +134,8 @@ pub fn enroll(dir: &Path, passphrase: &SecretString) -> Result<PathBuf> {
     }
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
-    fs::rename(&tmp, &file)?;
-    Ok(file)
+    fs::rename(&tmp, file)?;
+    Ok(())
 }
 
 /// Removes the sealed passphrase; returns whether one existed.
