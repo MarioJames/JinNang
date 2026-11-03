@@ -1,8 +1,16 @@
+![Jinnang 品牌标识](docs/assets/brand/jinnang-lockup.png)
+
 # Jinnang 锦囊
+
+**让编码 Agent 用引用代替明文，每次使用都留下记录。**
+
+> 凭证入囊，用过留痕。
 
 Jinnang 是一个面向 AI agent 的本地凭证库。agent 只持有 `jn://` 引用，不接触明文；凭证在本机以 age 非对称加密保存，使用时由工具注入目标命令或托管连接，每次使用都留下不含明文的审计记录。
 
 名字取自「锦囊妙计」：锦囊密封交付，持有人事先不知道内容，到了约定的时机、按约定的用途才能拆开。
+
+[品牌素材](docs/assets/brand/README.md)
 
 > 状态：**M1（加密存储与录入）+ L1 出口 `jinnang run`**。独立 UID broker、按策略签发的一次性授权、SSH 会话托管和防篡改审计在 M2 实现，见 [设计文档](docs/design.md)。
 
