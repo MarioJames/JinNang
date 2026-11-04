@@ -94,7 +94,7 @@ TOTP 验证码：当前没有专用命令；本机装有 `oathtool` 时可以 `j
 
 ## 追溯
 
-每次 `run`、`gen`、`rm` 都在审计日志记录引用、字段名、调用进程和会话标识（`CLAUDE_CODE_SESSION_ID`、`CODEX_THREAD_ID`、`HERDR_PANE_ID`、`WEAVER_RUN_ID`），`run` 另记命令和工作目录，都不含值。用 `JINNANG_TASK=<任务名> jinnang run ...` 把这次使用标到具体任务上。
+每次 `run`、`gen`、`rm`、`trash restore` 和回收站过期清除都在审计日志记录引用、字段名、调用进程和会话标识（`CLAUDE_CODE_SESSION_ID`、`CODEX_THREAD_ID`、`HERDR_PANE_ID`、`WEAVER_RUN_ID`），`run` 另记命令和工作目录，都不含值。用 `JINNANG_TASK=<任务名> jinnang run ...` 把这次使用标到具体任务上。
 
 ## 存入新凭证
 
@@ -118,7 +118,18 @@ jinnang rm jn://dev/acme/qa-01
 - 默认生成类型的必填秘密字段（`account`/`password`/`dsn` 的 `password`、`api_token` 的 `token`、`totp` 的 base32 `seed`）；其他字段用 `--gen FIELD` 指定，`--type generic` 时必须指定。
 - 目标系统限制字符时用 `--charset alnum` 或 `hex`，长度用 `--length N`。
 - `--set` 只接受非秘密字段，秘密字段写在命令行会被拒绝；自定义的 `--set` 字段自动标为公开。
-- `rm` 只用于本任务刚 `gen` 出来、注册没成功的条目；别的条目不要删，换值用 `jinnang rotate`。注册成功后条目保留，供后续登录和清理使用。
+- 注册成功后条目保留，供后续登录和清理使用。
+
+### 删除
+
+`jinnang rm` 把条目移进回收站，7 天内可恢复，之后由下一次写操作自动清除；没有立即销毁的命令。
+
+| 情况 | 做法 |
+| --- | --- |
+| 本任务 `gen` 的条目，注册没成功 | `jinnang rm <ref>` |
+| 目标环境里的账号已删除，凭证不再使用 | `jinnang rm <ref>` |
+| 误删 | `jinnang trash ls` 找到 id，`jinnang trash restore <ref 或 id>` |
+| 其他条目 | 不删；换值用 `jinnang rotate`。删除不是本任务创建的条目只在用户明确要求时做 |
 
 ### 其他由你生成的值
 

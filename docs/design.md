@@ -123,11 +123,13 @@ $XDG_STATE_HOME/jinnang/<hash>.json  信任状态：钉住的 vault_id、签名�
 
 - **免交互解锁（已完成）**：`jinnang unlock enroll` 校验口令后用 `systemd-creds --user`（本机凭证密钥，可叠加 TPM2）封存到信任状态目录；`--generate` 与 `init --self-held` 改用 jinnang 生成的 256 位随机口令（先封存并回读校验，再原子替换设备密钥文件），口令不显示、无人知晓，恢复只靠恢复包；解锁顺序为 `JINNANG_PASSPHRASE_FILE`（测试/CI）→ 封存口令 → 终端。调用方不传口令。M1 中同一用户仍可自行解封，M2 改由 broker 的独立 UID 持有该凭证。
 - **M1 存储与录入（已完成）**：
-  - 命令：`init`、`set`、`rotate`、`import-env`、`need`、`pending`、`ls`、`inspect`、`label`、`mv`、`rm`、`verify`、`backup`、`restore`；
+  - 命令：`init`、`set`、`rotate`、`import-env`、`need`、`pending`、`ls`、`inspect`、`label`、`mv`、`rm`、`trash`、`verify`、`backup`、`restore`；
   - 机制：pending 到激活、签名清单、回滚检测、恢复与换密钥。
 - **L1 出口 `jinnang run`（已完成）**：按字段注入 env、stdin 或私有临时文件（`{NAME}` 参数替换，结束即删）；对子进程输出做流式脱敏；每次使用在 `audit.jsonl` 记录 start/end（不含值，argv 中出现的值同样脱敏）。引用可带 `@vN` 使用历史版本。
 - **账号生成与文件内容（已完成）**：
-  - `jinnang gen` 用系统随机源生成秘密字段（默认类型的必填秘密字段，`--gen` 指定其他字段；`strong`/`alnum`/`hex` 字符集，每类字符至少出现一次；TOTP seed 为 160 位 base32），公开字段只能经 `--set` 传入，值不输出；`gen` 与 `rm` 写入审计事件，记录字段名、调用进程和会话标识。典型流程是 agent 生成 → `run` 注册 → 失败时 `rm`（墓碑删除，同名可重建）。
+  - `jinnang gen` 用系统随机源生成秘密字段（默认类型的必填秘密字段，`--gen` 指定其他字段；`strong`/`alnum`/`hex` 字符集，每类字符至少出现一次；TOTP seed 为 160 位 base32），公开字段只能经 `--set` 传入，值不输出；`gen` 与 `rm` 写入审计事件，记录字段名、调用进程和会话标识。典型流程是 agent 生成 → `run` 注册 → 失败时 `rm`。
+  - 删除只有回收站一条路：`rm` 在清单中标记 deleted（删除时间记在 `updated_at`），密文保留，7 天内 `trash restore` 可恢复；名称可被新条目占用，恢复时若已被占用则拒绝。回收站按名称或条目 id（8 位以上唯一前缀）定位，同名多次删除时必须用 id。
+  - 过期清除：没有常驻进程，所有写操作解锁后先清除删除时间早于 7 天的条目（从清单移除记录，再删除 `entries/<id>/` 与该条目的 pending 候选；先提交清单，中断时只留下 `verify` 报告的孤立文件）；删除时间无法解析时保留不删；清除失败只告警，不阻断本次写入。删除、恢复与过期清除都写入审计事件。
   - `set`/`rotate --from-file FIELD=PATH` 存文件内容；非 UTF-8 内容按 base64 存为二进制字段，`run --file`/`--stdin` 解码写出，脱敏同时覆盖 base64 和解码后的字节。
 - **M2 追溯闭环与 SSH**：
   - 独立 UID 的 broker、systemd 加密凭证解锁；
@@ -153,7 +155,7 @@ $XDG_STATE_HOME/jinnang/<hash>.json  信任状态：钉住的 vault_id、签名�
 - 只用 `jn://` 引用；不读取、打印或复制凭证文件、`.env` 的值、token、验证码、cookie、DSN。
 - **发现**：先 `jinnang find <关键词>` 或 `jinnang ls -l <选择器>`，再 `inspect` 核对；清单只含元数据（名称、标签、用途说明、公开字段、字段名），读取不需要口令。选择器必须唯一命中，不猜测、不回退到其他账号。
 - 缺凭证时运行 `jinnang need`，把生成的录入指令交给用户；不让用户在对话中粘贴明文。
-- agent 要在环境里创建的账号用 `jinnang gen` 生成，注册失败时 `jinnang rm` 删除本任务生成的条目；其他自行生成的值从生成器经管道存入 `jinnang set --stdin-json`。都写 `--desc` 和标签，供以后的 agent 发现。
+- agent 要在环境里创建的账号用 `jinnang gen` 生成，注册失败或凭证不再使用时 `jinnang rm`（进回收站，7 天后自动清除）；其他自行生成的值从生成器经管道存入 `jinnang set --stdin-json`。都写 `--desc` 和标签，供以后的 agent 发现。
 - 文件类凭证存内容（`--from-file`），不存路径。
 - 不把凭证或 token 写入记忆、报告、测试快照、日志或提交；疑似泄露时停止相关操作，报告引用，由用户轮换。
 

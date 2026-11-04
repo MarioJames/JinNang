@@ -79,7 +79,9 @@ jinnang mv jn://acme/app-db jn://acme/prod/app-db
 
 # 新版本 / 删除
 jinnang rotate jn://acme/prod/app-db              # 标签沿用，-l 可覆盖
-jinnang rm jn://acme/prod/app-db
+jinnang rm jn://acme/prod/app-db                  # 进回收站，7 天内可恢复；名称可被新条目使用
+jinnang trash ls                                  # 回收站：id、名称、删除时间、清除时间
+jinnang trash restore jn://acme/prod/app-db       # 恢复；同名删过多次时用 id（8 位以上前缀即可）
 
 # 免交互解锁：口令用 systemd 用户级加密凭证封存（本机密钥，有 TPM2 时叠加 TPM2），jinnang 自行解封，调用方（agent）不传口令
 jinnang unlock enroll              # 输入一次现有口令，校验后封存
@@ -160,9 +162,13 @@ ln -s ~/.agents/skills/jinnang ~/.claude/skills/jinnang  # Claude Code
 - `jinnang ls -l <选择器>` 按标签精确筛选，`jinnang inspect` 查看单个条目；
 - 用 `run`、`inspect` 时，选择器必须恰好命中一个条目，否则报错并列出候选，agent 不能「挑一个差不多的」。
 
-**agent 在环境里创建账号**：注册测试用户、服务账号时，先 `jinnang gen` 生成并存好凭证（输出只有公开字段），再 `jinnang run ... --env P=password -- <注册命令>` 拿引用去注册；注册失败就 `jinnang rm` 删掉这条，同名可以重新生成。`gen` 与 `rm` 都写入审计日志，带调用进程和会话标识，事后能查到哪个会话创建或丢弃了哪个账号。
+**agent 在环境里创建账号**：注册测试用户、服务账号时，先 `jinnang gen` 生成并存好凭证（输出只有公开字段），再 `jinnang run ... --env P=password -- <注册命令>` 拿引用去注册；注册失败就 `jinnang rm` 删掉这条，同名可以重新生成。`gen`、`rm`、`trash restore` 和过期清除都写入审计日志，带调用进程和会话标识，事后能查到哪个会话创建或丢弃了哪个账号。
 
 所以录入时值得多写一点元数据：用 `--desc` 说明系统、租户、角色和用途；从旧明文文件迁移时，把原文件名和变量名写进说明，读到旧记忆的 agent 也能按文件名找到对应条目。
+
+### 删除
+
+删除一律先进回收站：`ls`、`find`、`run` 不再可见，密文保留，7 天内可用 `jinnang trash restore` 恢复，名称可以先被新条目使用（恢复时若名称已被占用则拒绝，需先 `mv`）。超过 7 天的条目在之后任意一次写操作（`set`、`gen`、`rotate`、`rm`、`label` 等）解锁时自动硬删除：清单记录、全部版本密文和该条目的 pending 候选一并移除，并写入审计事件 `trash.expire`。没有常驻进程，因此清除发生在到期后的下一次写操作；清除失败只给出警告，不影响本次写入。
 
 ## 安全边界（M1）
 

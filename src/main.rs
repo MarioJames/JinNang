@@ -253,8 +253,14 @@ enum Command {
         #[arg(required = true, allow_hyphen_values = true, last = true)]
         command: Vec<String>,
     },
-    /// Delete an entry (tombstone; stored versions remain for recovery)
+    /// Delete an entry: it moves to the trash, stays restorable for 7 days and is
+    /// then purged by the next write
     Rm { reference: String },
+    /// Deleted entries: list or restore them (purged automatically after 7 days)
+    Trash {
+        #[command(subcommand)]
+        action: TrashAction,
+    },
     /// Verify signatures, digests and trust state; --deep also decrypts every version
     Verify {
         #[arg(long)]
@@ -318,6 +324,20 @@ enum UnlockAction {
     Status,
     /// Delete the sealed passphrase (commands prompt on a terminal again)
     Remove,
+}
+
+#[derive(Subcommand)]
+enum TrashAction {
+    /// List soft-deleted entries (no secret values)
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Bring a soft-deleted entry back under its name
+    Restore {
+        /// jn:// name, or the entry id (unique prefix of 8+ characters) when a name was deleted more than once
+        key: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -646,7 +666,7 @@ fn run(cli: Cli) -> Result<()> {
             }
             let mut vault = Vault::open(&dir, true)?;
             ensure!(vault.find(&entry).is_some(), "{entry} does not exist");
-            let keys = vault.unlock(&input::passphrase(&dir, "Vault passphrase: ")?)?;
+            let keys = unlock_for_write(&mut vault, &dir)?;
             let labels = vault.relabel(&keys, &entry, set, &remove)?;
             println!("{entry} labels: {}", labels_str(&labels));
         }
@@ -658,7 +678,7 @@ fn run(cli: Cli) -> Result<()> {
             let entry = Reference::parse_entry(&reference)?;
             let mut vault = Vault::open(&dir, true)?;
             ensure!(vault.find(&entry).is_some(), "{entry} does not exist");
-            let keys = vault.unlock(&input::passphrase(&dir, "Vault passphrase: ")?)?;
+            let keys = unlock_for_write(&mut vault, &dir)?;
             vault.describe(&keys, &entry, if clear { None } else { description })?;
             println!(
                 "{entry} description {}",
@@ -669,7 +689,7 @@ fn run(cli: Cli) -> Result<()> {
             let (from, to) = (Reference::parse_entry(&from)?, Reference::parse_entry(&to)?);
             let mut vault = Vault::open(&dir, true)?;
             ensure!(vault.find(&from).is_some(), "{from} does not exist");
-            let keys = vault.unlock(&input::passphrase(&dir, "Vault passphrase: ")?)?;
+            let keys = unlock_for_write(&mut vault, &dir)?;
             vault.rename(&keys, &from, &to)?;
             println!("renamed {from} -> {to}");
         }
@@ -714,15 +734,20 @@ fn run(cli: Cli) -> Result<()> {
             let entry = Reference::parse_entry(&reference)?;
             let mut vault = Vault::open(&dir, true)?;
             ensure!(vault.find(&entry).is_some(), "{entry} does not exist");
-            let keys = vault.unlock(&input::passphrase(&dir, "Vault passphrase: ")?)?;
-            let id = vault.find(&entry).map(|e| e.id);
-            vault.remove(&keys, &entry)?;
-            vault.audit(json!({
-                "event": "rm", "ref": entry.to_string(), "entry_id": id,
-                "caller": jinnang::store::submitter(), "session": run::session_hints(),
-            }))?;
-            println!("removed {entry}");
+            let keys = unlock_for_write(&mut vault, &dir)?;
+            let id = vault.remove(&keys, &entry)?;
+            let r = vault
+                .deleted()
+                .into_iter()
+                .find(|e| e.id == id)
+                .context("entry missing from the trash")?;
+            audit_delete(&vault, "rm", r)?;
+            println!(
+                "removed {entry} (id {id}); restorable with `jinnang trash restore {id}` until {}, then purged",
+                purge_after_str(r)
+            );
         }
+        Command::Trash { action } => trash(&dir, action)?,
         Command::Verify { deep } => {
             let vault = Vault::open(&dir, false)?;
             let keys = if deep {
@@ -957,9 +982,97 @@ fn submit(
     let keys = vault
         .unlock(&passphrase)
         .with_context(|| format!("candidate {} left pending", candidate.id))?;
+    purge_expired(&mut vault, &keys);
     let record = vault.activate(&keys, &candidate.id)?;
     println!("stored {} v{}", record.entry_ref, record.current);
     Ok(Some(record))
+}
+
+fn audit_delete(vault: &Vault, event: &str, e: &EntryRecord) -> Result<()> {
+    vault.audit(json!({
+        "event": event, "ref": e.entry_ref.to_string(), "entry_id": e.id,
+        "versions": e.versions.iter().map(|v| v.version).collect::<Vec<_>>(),
+        "caller": jinnang::store::submitter(), "session": run::session_hints(),
+    }))
+}
+
+fn purge_after_str(e: &EntryRecord) -> String {
+    jinnang::store::purge_after(e)
+        .and_then(|t| {
+            t.format(&time::format_description::well_known::Rfc3339)
+                .ok()
+        })
+        .unwrap_or_else(|| "unknown".into())
+}
+
+/// Unlocks for a write and first purges trash past its retention.
+fn unlock_for_write(vault: &mut Vault, dir: &Path) -> Result<KeyMaterial> {
+    let keys = vault.unlock(&input::passphrase(dir, "Vault passphrase: ")?)?;
+    purge_expired(vault, &keys);
+    Ok(keys)
+}
+
+/// Housekeeping: a failure is reported but never blocks the write that triggered it.
+fn purge_expired(vault: &mut Vault, keys: &KeyMaterial) {
+    match vault.purge_expired(keys, time::OffsetDateTime::now_utc()) {
+        Ok(purged) => {
+            for r in &purged {
+                if let Err(e) = audit_delete(vault, "trash.expire", r) {
+                    eprintln!("jinnang: warning: {e:#}");
+                }
+                eprintln!(
+                    "purged {} ({}) from the trash: deleted more than 7 days ago",
+                    r.entry_ref, r.id
+                );
+            }
+        }
+        Err(e) => eprintln!("jinnang: warning: purging expired trash failed: {e:#}"),
+    }
+}
+
+fn trash(dir: &Path, action: TrashAction) -> Result<()> {
+    match action {
+        TrashAction::Ls { json } => {
+            let vault = Vault::open(dir, false)?;
+            let deleted = vault.deleted();
+            if json {
+                let list: Vec<_> = deleted
+                    .iter()
+                    .map(|e| {
+                        let mut v = entry_json(e);
+                        v["deleted_at"] = json!(e.updated_at);
+                        v["purge_after"] = json!(purge_after_str(e));
+                        v
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&list)?);
+                return Ok(());
+            }
+            for e in deleted {
+                println!(
+                    "{}  {:<40} {:<11} v{:<4} deleted {}, purged after {}",
+                    e.id,
+                    e.entry_ref.to_string(),
+                    e.ty.as_str(),
+                    e.current,
+                    e.updated_at,
+                    purge_after_str(e)
+                );
+                if let Some(d) = &e.description {
+                    println!("    {d}");
+                }
+            }
+        }
+        TrashAction::Restore { key } => {
+            let mut vault = Vault::open(dir, true)?;
+            let id = vault.find_deleted(&key)?.id;
+            let keys = unlock_for_write(&mut vault, dir)?;
+            let r = vault.restore_deleted(&keys, id)?;
+            audit_delete(&vault, "trash.restore", &r)?;
+            println!("restored {} v{}", r.entry_ref, r.current);
+        }
+    }
+    Ok(())
 }
 
 fn pending(dir: &Path, action: PendingAction) -> Result<()> {
@@ -978,7 +1091,7 @@ fn pending(dir: &Path, action: PendingAction) -> Result<()> {
                 ids
             };
             ensure!(!ids.is_empty(), "nothing to activate");
-            let keys = vault.unlock(&input::passphrase(dir, "Vault passphrase: ")?)?;
+            let keys = unlock_for_write(&mut vault, dir)?;
             let mut failed = 0;
             for id in ids {
                 match vault.activate(&keys, &id) {

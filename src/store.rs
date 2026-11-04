@@ -30,6 +30,8 @@ use crate::schema::{self, EntryType, Fields};
 use crate::selector::{Labels, Selector};
 
 pub const FORMAT: u32 = 1;
+/// Soft-deleted entries stay restorable this long, then the next write purges them.
+pub const TRASH_RETENTION: time::Duration = time::Duration::days(7);
 const VAULT_FILE: &str = "vault.json";
 const IDENTITY_FILE: &str = "identity.age";
 const MANIFEST_FILE: &str = "manifest.json";
@@ -736,13 +738,116 @@ impl Vault {
             .with_context(|| format!("{entry_ref} does not exist"))
     }
 
-    /// Tombstones an entry. Ciphertexts stay for history and recovery.
-    pub fn remove(&mut self, keys: &KeyMaterial, entry_ref: &EntryRef) -> Result<()> {
+    /// Deletes an entry softly: tombstoned, ciphertexts kept, restorable with
+    /// `restore_deleted` for `TRASH_RETENTION`; the name is free for a new entry.
+    pub fn remove(&mut self, keys: &KeyMaterial, entry_ref: &EntryRef) -> Result<Uuid> {
         let mut manifest = self.manifest.clone();
         let e = Self::live_mut(&mut manifest, entry_ref)?;
         e.deleted = true;
         e.updated_at = now();
-        self.commit(keys, manifest)
+        let id = e.id;
+        self.commit(keys, manifest)?;
+        Ok(id)
+    }
+
+    /// Soft-deleted entries, oldest deletion first.
+    pub fn deleted(&self) -> Vec<&EntryRecord> {
+        let mut out: Vec<_> = self.manifest.entries.iter().filter(|e| e.deleted).collect();
+        out.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
+        out
+    }
+
+    /// Finds one soft-deleted entry by `jn://` name or by id (a unique prefix of at
+    /// least 8 characters is enough). Several deletions under one name need the id.
+    pub fn find_deleted(&self, key: &str) -> Result<&EntryRecord> {
+        let hits: Vec<&EntryRecord> = if key.starts_with(crate::refs::SCHEME) {
+            let r = crate::refs::Reference::parse_entry(key)?;
+            self.deleted()
+                .into_iter()
+                .filter(|e| e.entry_ref == r)
+                .collect()
+        } else {
+            ensure!(
+                key.len() >= 8,
+                "give a jn:// name or at least 8 characters of the entry id"
+            );
+            let key = key.to_ascii_lowercase();
+            self.deleted()
+                .into_iter()
+                .filter(|e| e.id.to_string().starts_with(&key))
+                .collect()
+        };
+        match hits.as_slice() {
+            [one] => Ok(one),
+            [] => bail!("nothing in the trash matches {key:?} (see `jinnang trash ls`)"),
+            many => bail!(
+                "{} deleted entries match {key:?}; give the id: {}",
+                many.len(),
+                many.iter()
+                    .map(|e| e.id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
+
+    /// Undoes a soft delete. Fails while a live entry holds the same name.
+    pub fn restore_deleted(&mut self, keys: &KeyMaterial, id: Uuid) -> Result<EntryRecord> {
+        let mut manifest = self.manifest.clone();
+        let e = manifest
+            .entries
+            .iter()
+            .find(|e| e.deleted && e.id == id)
+            .with_context(|| format!("entry {id} is not in the trash"))?;
+        ensure!(
+            self.find(&e.entry_ref).is_none(),
+            "{} is taken by another entry; rename that one first (jinnang mv)",
+            e.entry_ref
+        );
+        let e = manifest.entries.iter_mut().find(|e| e.id == id).unwrap();
+        e.deleted = false;
+        e.updated_at = now();
+        let record = e.clone();
+        self.commit(keys, manifest)?;
+        Ok(record)
+    }
+
+    /// Hard deletes every soft-deleted entry whose retention has passed at `now`.
+    pub fn purge_expired(
+        &mut self,
+        keys: &KeyMaterial,
+        now: OffsetDateTime,
+    ) -> Result<Vec<EntryRecord>> {
+        let ids = expired_trash(&self.manifest.entries, now);
+        ids.into_iter().map(|id| self.purge(keys, id)).collect()
+    }
+
+    /// Hard delete: removes a soft-deleted entry from the manifest, then every
+    /// stored version and every pending candidate for it.
+    fn purge(&mut self, keys: &KeyMaterial, id: Uuid) -> Result<EntryRecord> {
+        let mut manifest = self.manifest.clone();
+        let i = manifest
+            .entries
+            .iter()
+            .position(|e| e.deleted && e.id == id)
+            .with_context(|| format!("entry {id} is not in the trash"))?;
+        let record = manifest.entries.remove(i);
+        // Manifest first: an interrupted purge leaves orphan files that `verify`
+        // reports, never a manifest pointing at missing ciphertexts.
+        self.commit(keys, manifest)?;
+        let dir = self.dir.join("entries").join(id.to_string());
+        match fs::remove_dir_all(&dir) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                return Err(e).with_context(|| format!("cannot remove {}", dir.display()));
+            }
+            _ => {}
+        }
+        for p in self.pending()? {
+            if p.header.entry_id == id {
+                self.drop_pending(&p.id)?;
+            }
+        }
+        Ok(record)
     }
 
     /// Sets and removes labels (no new version; the signed manifest changes).
@@ -1103,6 +1208,23 @@ impl Vault {
     }
 }
 
+/// When a soft-deleted entry is purged: its deletion time plus `TRASH_RETENTION`.
+pub fn purge_after(e: &EntryRecord) -> Option<OffsetDateTime> {
+    OffsetDateTime::parse(&e.updated_at, &Rfc3339)
+        .ok()
+        .map(|t| t + TRASH_RETENTION)
+}
+
+/// Soft-deleted entries due for purging at `now`. An unreadable deletion time
+/// keeps the entry (never purge on doubt).
+fn expired_trash(entries: &[EntryRecord], now: OffsetDateTime) -> Vec<Uuid> {
+    entries
+        .iter()
+        .filter(|e| e.deleted && purge_after(e).is_some_and(|t| t <= now))
+        .map(|e| e.id)
+        .collect()
+}
+
 fn split_fields(ty: EntryType, payload: &Payload) -> (BTreeMap<String, String>, Vec<String>) {
     let mut public = BTreeMap::new();
     let mut secret = Vec::new();
@@ -1177,4 +1299,41 @@ pub fn check_description(d: &str) -> Result<()> {
         "description must be a single line without control characters"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use time::macros::datetime;
+
+    fn record(deleted: bool, updated_at: &str) -> EntryRecord {
+        EntryRecord {
+            id: Uuid::new_v4(),
+            entry_ref: EntryRef { path: "a".into() },
+            ty: EntryType::Password,
+            labels: Labels::new(),
+            description: None,
+            public: BTreeMap::new(),
+            secret_fields: vec!["password".into()],
+            binary_fields: BTreeSet::new(),
+            current: 1,
+            deleted,
+            updated_at: updated_at.into(),
+            versions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn only_trash_older_than_retention_expires() {
+        let old = record(true, "2026-11-01T00:00:00Z");
+        let fresh = record(true, "2026-11-05T00:00:00Z");
+        let live = record(false, "2026-10-01T00:00:00Z");
+        let unreadable = record(true, "yesterday");
+        let entries = [old.clone(), fresh, live, unreadable];
+        assert!(expired_trash(&entries, datetime!(2026-11-07 23:59 UTC)).is_empty());
+        assert_eq!(
+            expired_trash(&entries, datetime!(2026-11-08 00:00 UTC)),
+            vec![old.id]
+        );
+    }
 }

@@ -1131,7 +1131,7 @@ fn gen_creates_usable_accounts_without_printing_secrets_and_rm_discards_them() {
     );
     assert!(!run(env.cmd().args(["gen", r, "--set", "username=qa-01"])).ok);
 
-    // Registration failed: discard the entry, then the same name can be generated again.
+    // Registration failed: delete the entry, then the same name can be generated again.
     assert!(run(env.cmd().args(["rm", r])).ok);
     assert!(ls_refs(&env, "env=dev").is_empty());
     let out = run(env.cmd().args([
@@ -1273,4 +1273,77 @@ fn run_uses_an_older_version_when_asked() {
             .args(["run", "jn://prod/acme/app-db@v9", "--", "true"]))
         .ok
     );
+}
+
+#[test]
+fn deleted_entries_stay_restorable_in_the_trash() {
+    let env = Env::new();
+    env.init();
+    let r = "jn://prod/acme/app-db";
+    let check = |expected: &str| {
+        run(env
+            .cmd()
+            .args(["run", r, "--env", "P=password", "--", "sh", "-c"])
+            .arg(format!(r#"test "$P" = '{expected}'"#)))
+        .ok
+    };
+    let trash = || -> Vec<Value> {
+        serde_json::from_str::<Value>(&run(env.cmd().args(["trash", "ls", "--json"])).text)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .clone()
+    };
+
+    // Deleted: hidden and unusable, ciphertext kept, purge date 7 days out.
+    assert!(env.set_dsn(DB_PASSWORD).ok);
+    let first_id = env.manifest()["entries"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let out = run(env.cmd().args(["rm", r]));
+    assert!(out.ok && out.text.contains("trash restore"), "{}", out.text);
+    assert!(!run(env.cmd().args(["inspect", r])).ok);
+    assert!(!check(DB_PASSWORD));
+    let items = trash();
+    assert_eq!(items.len(), 1);
+    let parse = |v: &Value| {
+        time::OffsetDateTime::parse(
+            v.as_str().unwrap(),
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        parse(&items[0]["purge_after"]) - parse(&items[0]["deleted_at"]),
+        time::Duration::days(7)
+    );
+    assert!(env.vault().join("entries").join(&first_id).exists());
+    assert!(run(env.cmd().args(["trash", "restore", r])).ok);
+    assert!(check(DB_PASSWORD));
+    assert!(trash().is_empty());
+
+    // The name is reusable meanwhile; a restore never overwrites it, and two
+    // deletions under one name are picked by id.
+    assert!(run(env.cmd().args(["rm", r])).ok);
+    assert!(env.set_dsn("second-password-xyz").ok);
+    let out = run(env.cmd().args(["trash", "restore", r]));
+    assert!(!out.ok && out.text.contains("taken"), "{}", out.text);
+    assert!(run(env.cmd().args(["rm", r])).ok);
+    let out = run(env.cmd().args(["trash", "restore", r]));
+    assert!(!out.ok && out.text.contains(&first_id), "{}", out.text);
+    assert!(run(env.cmd().args(["trash", "restore", &first_id[..8]])).ok);
+    assert!(check(DB_PASSWORD));
+
+    // Writes purge only expired trash: a fresh deletion survives them.
+    assert!(run(env.cmd().args(["label", r, "team=platform"])).ok);
+    assert!(run(env.cmd().args(["describe", r, "acme app role"])).ok);
+    let second_id = trash()[0]["id"].as_str().unwrap().to_string();
+    assert!(env.vault().join("entries").join(&second_id).exists());
+    assert_eq!(trash().len(), 1);
+    assert!(run(env.cmd().args(["verify", "--deep"])).ok);
+
+    let audit = fs::read_to_string(env.vault().join("audit.jsonl")).unwrap();
+    assert_no_secret(&audit);
+    assert!(audit.contains("\"event\":\"rm\"") && audit.contains("\"trash.restore\""));
 }
