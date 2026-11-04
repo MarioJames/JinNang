@@ -12,7 +12,7 @@ Jinnang 是一个面向 AI agent 的本地凭证库。agent 只持有 `jn://` �
 
 [品牌素材](docs/assets/brand/README.md)
 
-> 状态：**M1（加密存储与录入）+ L1 出口 `jinnang run`**。独立 UID broker、按策略签发的一次性授权、SSH 会话托管和防篡改审计在 M2 实现，见 [设计文档](docs/design.md)。
+> 状态：**M1（加密存储与录入）+ L1 出口 `jinnang run` + 账号生成 `jinnang gen`**。独立 UID broker、按策略签发的一次性授权、SSH 会话托管和防篡改审计在 M2 实现，见 [设计文档](docs/design.md)。
 
 ## 它解决什么
 
@@ -51,6 +51,11 @@ jinnang set jn://acme/app-db --type dsn -l env=prod -l team=platform --desc 'acm
 jinnang set jn://acme/ops-otp --type totp            # 可直接粘贴 otpauth:// URI
 jinnang set jn://notion --field api_key --field workspace --public workspace   # generic 类型，自定义字段
 jinnang import-env ./app.env jn://acme/app-env --public PORT,NODE_ENV -l env=dev
+jinnang set jn://acme/signing/cert --from-file p12=./cert.p12 --field password   # 存文件内容；二进制自动转 base64
+
+# 生成：密码等秘密字段由 jinnang 随机生成，不显示；公开字段用 --set
+jinnang gen jn://dev/acme/qa-01 --set username=qa-01 -l env=dev --desc 'acme dev QA 账号'
+jinnang gen jn://dev/acme/hook --type generic --gen signing_secret --length 48 --charset alnum
 
 # 查看（不含秘密值，不需要口令）；-l 按标签过滤，find 按关键词检索
 jinnang find acme prod
@@ -64,6 +69,8 @@ jinnang run -l env=prod,team=platform --env PGPASSWORD=password -- psql ...   # 
 jinnang run jn://acme/deploy-key --file KEY=private_key -- ssh -i {KEY} -o IdentitiesOnly=yes root@host true
 jinnang run jn://acme/app-env --env-file CREDS -- ./deploy.sh --credentials {CREDS}
 jinnang run jn://acme/token --stdin token -- mycli login --token-stdin
+jinnang run jn://acme/signing/cert --file P12=p12 -- cp {P12} ./restored.p12   # 二进制字段按原始字节还原
+jinnang run jn://acme/app-db@v1 --env PGPASSWORD=password -- psql ...           # @vN 使用历史版本
 
 # 整理：改标签（key- 删除）、改说明、改名；都不产生新版本
 jinnang label jn://acme/app-db owner=alice team-
@@ -126,6 +133,8 @@ jinnang run -l tenant=poc,role=sales --env PW=password -- ./login.sh
 | `env_bundle` | 任意 `KEY`，默认全部为秘密，用 `--public` 标出非秘密的键 |
 | `generic`（默认） | 无预设字段，全部自定义 |
 
+文件类凭证用 `--from-file FIELD=PATH` 整个读入（`set`、`rotate` 可用，可与 `--stdin-json` 或终端提示合并）。UTF-8 文本原样保存；其他内容以 base64 保存并标为二进制字段：`run --file`、`--stdin` 写出原始字节，`--env`、`--env-file`、`--all-env` 给出 base64（例如 electron-builder 的 `CSC_LINK` 直接接受）。存内容而不是路径：路径只在一台机器上有效，文件本身也仍在 vault 外。
+
 环境变量：
 
 | 变量 | 作用 |
@@ -150,6 +159,8 @@ ln -s ~/.agents/skills/jinnang ~/.claude/skills/jinnang  # Claude Code
 - `jinnang find <关键词...>` 在名称、标签、用途说明、公开字段（用户名、主机、URL）和字段名里检索，所有关键词都命中才列出；秘密值不参与检索；
 - `jinnang ls -l <选择器>` 按标签精确筛选，`jinnang inspect` 查看单个条目；
 - 用 `run`、`inspect` 时，选择器必须恰好命中一个条目，否则报错并列出候选，agent 不能「挑一个差不多的」。
+
+**agent 在环境里创建账号**：注册测试用户、服务账号时，先 `jinnang gen` 生成并存好凭证（输出只有公开字段），再 `jinnang run ... --env P=password -- <注册命令>` 拿引用去注册；注册失败就 `jinnang rm` 删掉这条，同名可以重新生成。`gen` 与 `rm` 都写入审计日志，带调用进程和会话标识，事后能查到哪个会话创建或丢弃了哪个账号。
 
 所以录入时值得多写一点元数据：用 `--desc` 说明系统、租户、角色和用途；从旧明文文件迁移时，把原文件名和变量名写进说明，读到旧记忆的 agent 也能按文件名找到对应条目。
 

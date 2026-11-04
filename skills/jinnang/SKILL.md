@@ -52,13 +52,13 @@ Jinnang 是本机的凭证库。你只持有 `jn://` 引用，由 `jinnang` 把�
 
 | 方式 | 写法 | 子进程得到 |
 | --- | --- | --- |
-| 环境变量 | `--env NAME=field` | `$NAME` |
+| 环境变量 | `--env NAME=field` | `$NAME`（二进制字段为 base64） |
 | 全部字段 | `--all-env` | env_bundle / generic 的键原样，其他类型为 `JN_<FIELD>` |
-| 标准输入 | `--stdin field` | 值从 stdin 读入 |
-| 私有文件 | `--file NAME=field` | 0600 临时文件；`$NAME` 和参数中的 `{NAME}` 替换为路径，结束即删 |
+| 标准输入 | `--stdin field` | 值从 stdin 读入（二进制字段为原始字节） |
+| 私有文件 | `--file NAME=field` | 0600 临时文件，内容是原始文件（二进制字段已解码）；`$NAME` 和参数中的 `{NAME}` 替换为路径，结束即删 |
 | dotenv 文件 | `--env-file NAME` | 全部字段写成 dotenv 文件，同上 |
 
-输出中出现的秘密值会被替换成 `[jinnang:redacted]`，退出码原样返回。值不要放进命令行参数（其他进程能从 `/proc` 看到）；需要拼接时在子 shell 里用内建命令处理：
+引用末尾加 `@vN`（如 `jn://acme/app-db@v1`）使用历史版本，`inspect` 列出现有版本。输出中出现的秘密值会被替换成 `[jinnang:redacted]`，退出码原样返回。值不要放进命令行参数（其他进程能从 `/proc` 看到）；需要拼接时在子 shell 里用内建命令处理：
 
 ```bash
 # 数据库
@@ -81,6 +81,10 @@ jinnang run jn://cloudflare/main --env T=token -- \
 # 应用配置：整包 .env
 jinnang run jn://local/app-env --env-file CREDS -- ./deploy.sh --env-file {CREDS}
 
+# 证书等文件：还原成文件交给需要路径的程序
+jinnang run jn://acme/signing/cert --file P12=p12 --env PW=password -- \
+  sh -c 'security import "$P12" -k "$KEYCHAIN" -P "$PW" -T /usr/bin/codesign'
+
 # 网页登录：值只在子进程里传给浏览器工具
 jinnang run jn://work/poc/qa-sales --env U=username --env P=password -- \
   sh -c 'agent-browser fill "#email" "$U" && agent-browser fill "#password" "$P"'
@@ -90,17 +94,54 @@ TOTP 验证码：当前没有专用命令；本机装有 `oathtool` 时可以 `j
 
 ## 追溯
 
-每次 `run` 都在审计日志记录引用、字段名、命令、工作目录、调用进程和会话标识（`CLAUDE_CODE_SESSION_ID`、`CODEX_THREAD_ID`、`HERDR_PANE_ID`、`WEAVER_RUN_ID`），不含值。用 `JINNANG_TASK=<任务名> jinnang run ...` 把这次使用标到具体任务上。
+每次 `run`、`gen`、`rm` 都在审计日志记录引用、字段名、调用进程和会话标识（`CLAUDE_CODE_SESSION_ID`、`CODEX_THREAD_ID`、`HERDR_PANE_ID`、`WEAVER_RUN_ID`），`run` 另记命令和工作目录，都不含值。用 `JINNANG_TASK=<任务名> jinnang run ...` 把这次使用标到具体任务上。
 
 ## 存入新凭证
 
-由你生成的密码、token（例如部署时新建的数据库角色）直接从生成器经管道存入，不经过你的输出：
+### 在环境里创建账号
+
+需要在某个环境里注册测试用户、服务账号时，先让 jinnang 生成并存好凭证，再拿引用去注册；密码从随机源直接进入 vault，不经过你的输出：
+
+```bash
+# 1. 生成：用户名等公开字段用 --set 传，密码由 jinnang 生成（默认 24 位，含大小写、数字和符号）
+jinnang gen jn://dev/acme/qa-01 --set username=qa-01 --set login_url=https://acme.test/login \
+  -l env=dev -l app=acme --desc 'acme dev 环境 QA 测试账号 qa-01（agent 注册）'
+
+# 2. 注册：值只在子进程里
+jinnang run jn://dev/acme/qa-01 --env U=username --env P=password -- \
+  sh -c 'printf "%s" "$P" | ./admin create-user "$U" --password-stdin'
+
+# 3. 注册失败：删掉这次生成的条目，同名可以重新 gen
+jinnang rm jn://dev/acme/qa-01
+```
+
+- 默认生成类型的必填秘密字段（`account`/`password`/`dsn` 的 `password`、`api_token` 的 `token`、`totp` 的 base32 `seed`）；其他字段用 `--gen FIELD` 指定，`--type generic` 时必须指定。
+- 目标系统限制字符时用 `--charset alnum` 或 `hex`，长度用 `--length N`。
+- `--set` 只接受非秘密字段，秘密字段写在命令行会被拒绝；自定义的 `--set` 字段自动标为公开。
+- `rm` 只用于本任务刚 `gen` 出来、注册没成功的条目；别的条目不要删，换值用 `jinnang rotate`。注册成功后条目保留，供后续登录和清理使用。
+
+### 其他由你生成的值
+
+部署时新建的数据库角色等，从生成器经管道存入：
 
 ```bash
 openssl rand -base64 32 | tr -d '\n' | jq -Rs '{password: .}' | \
   jinnang set jn://acme/prod/db-app --type password --stdin-json \
     -l env=prod -l app=acme --desc 'acme 生产库应用角色 app_rw'
 ```
+
+### 文件类凭证
+
+证书、私钥、kubeconfig 这类文件存内容，不存路径（路径只在这台机器有效，文件本身还留在 vault 外）：
+
+```bash
+jinnang set jn://acme/signing/cert --from-file p12=./cert.p12 --field password \
+  -l app=acme --desc 'acme 代码签名证书（p12 与导入密码）'
+```
+
+`--field` 在终端里提示输入；没有终端时用 `--stdin-json` 提供其余字段，与 `--from-file` 合并。文本文件原样保存；二进制文件以 base64 保存并标为二进制（`inspect` 显示 `<secret, binary>`），`run --file` 还原成逐字节相同的文件。
+
+### 通用
 
 - 给每个条目写 `--desc`：一句话说明系统、租户、角色和用途，让以后的 agent 能用 `jinnang find` 找到它；条目已存在时用 `jinnang describe <ref> '<说明>'` 补写，用 `jinnang label <ref> k=v` 补标签。
 - vault 处于锁定状态时写入会成为 pending 候选，告诉用户运行 `jinnang pending activate <id>`。

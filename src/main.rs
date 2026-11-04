@@ -8,6 +8,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use serde_json::json;
 
 use jinnang::crypto::{self, KeyMaterial};
+use jinnang::generate::{self, Charset};
 use jinnang::input;
 use jinnang::refs::{EntryRef, Reference};
 use jinnang::run;
@@ -49,6 +50,28 @@ struct Target {
 }
 
 impl Target {
+    /// Like `parse`, but the reference may carry `@vN` to pick an older version.
+    fn parse_versioned(&self) -> Result<(Option<EntryRef>, Option<u32>, Option<Selector>)> {
+        let r = self
+            .reference
+            .as_deref()
+            .map(Reference::parse)
+            .transpose()?;
+        if let Some(r) = &r {
+            ensure!(
+                r.field.is_none(),
+                "give the whole entry; choose fields with --env/--file/--stdin"
+            );
+        }
+        let s = self.selector.as_deref().map(Selector::parse).transpose()?;
+        ensure!(
+            r.is_some() || s.is_some(),
+            "give a jn:// reference or -l <selector>"
+        );
+        let version = r.as_ref().and_then(|r| r.version);
+        Ok((r.map(|r| r.entry), version, s))
+    }
+
     fn parse(&self) -> Result<(Option<EntryRef>, Option<Selector>)> {
         let r = self
             .reference
@@ -83,6 +106,36 @@ enum Command {
         ty: EntryType,
         #[command(flatten)]
         write: WriteOpts,
+    },
+    /// Create an entry with random secrets, e.g. for an account an agent registers;
+    /// generated values are never printed
+    ///
+    /// Example: jinnang gen jn://dev/acme/qa-01 --set username=qa-01 -l env=dev
+    Gen {
+        reference: String,
+        #[arg(long = "type", value_enum, default_value = "account")]
+        ty: EntryType,
+        /// FIELD=VALUE for a non-secret field such as username or login_url (repeatable)
+        #[arg(long = "set", value_name = "FIELD=VALUE")]
+        set: Vec<String>,
+        /// Field to fill with a random value (repeatable) [default: the type's required secret fields]
+        #[arg(long = "gen", value_name = "FIELD")]
+        generate: Vec<String>,
+        /// Length of each generated value
+        #[arg(long, default_value_t = generate::DEFAULT_LENGTH)]
+        length: usize,
+        /// Characters of generated values (a TOTP seed is always base32)
+        #[arg(long, value_enum, default_value = "strong")]
+        charset: Charset,
+        /// key=value label (repeatable)
+        #[arg(short = 'l', long = "label", value_name = "KEY=VALUE")]
+        labels: Vec<String>,
+        /// One line saying what the entry is for (shown to agents choosing an entry)
+        #[arg(long)]
+        desc: Option<String>,
+        /// Only write a pending candidate; do not ask for the passphrase
+        #[arg(long)]
+        pending: bool,
     },
     /// Store a new version of an existing entry (labels are kept unless overridden)
     Rotate {
@@ -173,6 +226,9 @@ enum Command {
     /// Run a command with fields of one entry injected (L1: prevents accidental exposure)
     ///
     /// Example: jinnang run jn://acme/db --env PGPASSWORD=password -- psql -h db -U app
+    ///
+    /// The reference may end in @vN to use an older version. Binary fields are
+    /// decoded for --file and --stdin; --env and --env-file carry their base64.
     Run {
         #[command(flatten)]
         target: Target,
@@ -241,6 +297,10 @@ struct WriteOpts {
     /// Read field values as a JSON object from stdin
     #[arg(long)]
     stdin_json: bool,
+    /// FIELD=PATH: take the whole file as the field's value (repeatable); text is
+    /// kept as is, binary content is stored as base64 and decoded again by `run --file`
+    #[arg(long = "from-file", value_name = "FIELD=PATH")]
+    from_file: Vec<String>,
     /// Only write a pending candidate; do not ask for the passphrase
     #[arg(long)]
     pending: bool,
@@ -349,6 +409,47 @@ fn run(cli: Cli) -> Result<()> {
             let entry = Reference::parse_entry(&reference)?;
             store(&dir, &entry, ty, write, false)?;
         }
+        Command::Gen {
+            reference,
+            ty,
+            set,
+            generate: wanted,
+            length,
+            charset,
+            labels,
+            desc,
+            pending,
+        } => {
+            let entry = Reference::parse_entry(&reference)?;
+            let (fields, public, generated) = generated_fields(ty, &set, &wanted, length, charset)?;
+            let record = submit(
+                &dir,
+                &entry,
+                ty,
+                fields,
+                public.into_iter().collect(),
+                BTreeSet::new(),
+                parse_labels(&labels)?,
+                desc,
+                pending,
+                false,
+            )?;
+            let vault = Vault::open(&dir, false)?;
+            vault.audit(json!({
+                "event": "gen", "ref": entry.to_string(), "fields": generated,
+                "active": record.is_some(), "caller": jinnang::store::submitter(),
+                "session": run::session_hints(),
+            }))?;
+            println!(
+                "generated {} (not shown; use it through `jinnang run {entry} --env NAME=FIELD -- ...`)",
+                generated.join(", ")
+            );
+            if let Some(r) = record {
+                for (k, v) in &r.public {
+                    println!("  {k:<24} {v}");
+                }
+            }
+        }
         Command::Rotate { reference, write } => {
             let entry = Reference::parse_entry(&reference)?;
             let ty = Vault::open(&dir, false)?
@@ -374,6 +475,7 @@ fn run(cli: Cli) -> Result<()> {
                 EntryType::EnvBundle,
                 fields,
                 public,
+                BTreeSet::new(),
                 parse_labels(&labels)?,
                 desc,
                 pending,
@@ -410,7 +512,9 @@ fn run(cli: Cli) -> Result<()> {
             }
             let cmd = match ty {
                 EntryType::EnvBundle => format!("jinnang import-env <file> {entry}{label_args}"),
-                EntryType::Generic => format!("jinnang set {entry} --field <NAME>...{label_args}"),
+                EntryType::Generic => format!(
+                    "jinnang set {entry} --field <NAME>...{label_args}   (whole files: --from-file <NAME>=<path>)"
+                ),
                 _ => format!("jinnang set {entry} --type {}{label_args}", ty.as_str()),
             };
             println!("Ask the user to run this in their own terminal:\n\n    {cmd}\n");
@@ -510,7 +614,12 @@ fn run(cli: Cli) -> Result<()> {
                     println!("  {k:<24} {v}");
                 }
                 for k in &e.secret_fields {
-                    println!("  {k:<24} <secret>");
+                    let kind = if e.binary_fields.contains(k) {
+                        "<secret, binary>"
+                    } else {
+                        "<secret>"
+                    };
+                    println!("  {k:<24} {kind}");
                 }
                 println!(
                     "versions {}",
@@ -574,7 +683,7 @@ fn run(cli: Cli) -> Result<()> {
             no_redact,
             command,
         } => {
-            let (r, s) = target.parse()?;
+            let (r, version, s) = target.parse_versioned()?;
             let spec = run::RunSpec {
                 env: env
                     .iter()
@@ -590,7 +699,15 @@ fn run(cli: Cli) -> Result<()> {
                 redact: !no_redact,
             };
             let passphrase = input::passphrase(&dir, "Vault passphrase: ")?;
-            let code = run::run(&dir, r.as_ref(), s.as_ref(), &spec, &command, &passphrase)?;
+            let code = run::run(
+                &dir,
+                r.as_ref(),
+                version,
+                s.as_ref(),
+                &spec,
+                &command,
+                &passphrase,
+            )?;
             std::process::exit(code);
         }
         Command::Rm { reference } => {
@@ -598,7 +715,12 @@ fn run(cli: Cli) -> Result<()> {
             let mut vault = Vault::open(&dir, true)?;
             ensure!(vault.find(&entry).is_some(), "{entry} does not exist");
             let keys = vault.unlock(&input::passphrase(&dir, "Vault passphrase: ")?)?;
+            let id = vault.find(&entry).map(|e| e.id);
             vault.remove(&keys, &entry)?;
+            vault.audit(json!({
+                "event": "rm", "ref": entry.to_string(), "entry_id": id,
+                "caller": jinnang::store::submitter(), "session": run::session_hints(),
+            }))?;
             println!("removed {entry}");
         }
         Command::Verify { deep } => {
@@ -676,22 +798,124 @@ fn store(
     rotate: bool,
 ) -> Result<()> {
     let public: BTreeSet<String> = write.public.iter().cloned().collect();
-    let fields: Fields = if write.stdin_json {
+    let mut from_file = Fields::new();
+    let mut binary = BTreeSet::new();
+    for spec in &write.from_file {
+        let (name, path) = spec
+            .split_once('=')
+            .with_context(|| format!("invalid --from-file {spec:?}; expected FIELD=PATH"))?;
+        ensure!(
+            jinnang::refs::valid_field_name(name),
+            "invalid field name {name:?}"
+        );
+        let (value, is_binary) = input::read_file_field(Path::new(path))?;
+        if is_binary {
+            binary.insert(name.to_string());
+        }
+        ensure!(
+            from_file.insert(name.to_string(), value).is_none(),
+            "field {name:?} given twice"
+        );
+    }
+    let only_files = !from_file.is_empty()
+        && write.fields.is_empty()
+        && matches!(ty, EntryType::Generic | EntryType::EnvBundle);
+    let mut fields: Fields = if write.stdin_json {
         input::stdin_fields()?
+    } else if only_files {
+        Fields::new()
     } else {
-        input::prompt_fields(ty, &write.fields, &public)?
+        let skip = from_file.keys().cloned().collect();
+        input::prompt_fields(ty, &write.fields, &public, &skip)?
     };
+    for (name, value) in from_file {
+        ensure!(
+            fields.insert(name.clone(), value).is_none(),
+            "field {name:?} given twice"
+        );
+    }
     submit(
         dir,
         entry,
         ty,
         fields,
         write.public,
+        binary,
         parse_labels(&write.labels)?,
         write.desc,
         write.pending,
         rotate,
-    )
+    )?;
+    Ok(())
+}
+
+/// Fields for `gen`: non-secret values from `--set`, random values for the rest.
+/// Returns the fields, the custom fields to mark public and the generated names.
+fn generated_fields(
+    ty: EntryType,
+    set: &[String],
+    wanted: &[String],
+    length: usize,
+    charset: Charset,
+) -> Result<(Fields, Vec<String>, Vec<String>)> {
+    let mut fields = Fields::new();
+    let mut public = Vec::new();
+    for pair in set {
+        let (name, value) = pair
+            .split_once('=')
+            .with_context(|| format!("invalid --set {pair:?}; expected FIELD=VALUE"))?;
+        ensure!(
+            jinnang::refs::valid_field_name(name),
+            "invalid field name {name:?}"
+        );
+        match ty.spec(name) {
+            Some(spec) if spec.secret => bail!(
+                "{name:?} is a secret field of {}; let jinnang generate it (--gen {name}) instead of passing it on the command line",
+                ty.as_str()
+            ),
+            Some(_) => {}
+            // Values on the command line are not secret, so custom --set fields are public.
+            None => public.push(name.to_string()),
+        }
+        ensure!(
+            fields
+                .insert(name.to_string(), value.to_string().into())
+                .is_none(),
+            "field {name:?} given twice"
+        );
+    }
+    let generated: Vec<String> = if wanted.is_empty() {
+        generate::default_fields(ty)
+            .into_iter()
+            .map(String::from)
+            .collect()
+    } else {
+        wanted.to_vec()
+    };
+    ensure!(
+        !generated.is_empty(),
+        "type {} has no required secret field; name the field to generate with --gen FIELD",
+        ty.as_str()
+    );
+    for name in &generated {
+        ensure!(
+            jinnang::refs::valid_field_name(name),
+            "invalid field name {name:?}"
+        );
+        if ty.spec(name).is_some_and(|s| !s.secret) {
+            bail!("{name:?} is not a secret field; give it with --set {name}=VALUE");
+        }
+        let value = if ty == EntryType::Totp && name == "seed" {
+            generate::totp_seed()?
+        } else {
+            generate::secret(length, charset)?
+        };
+        ensure!(
+            fields.insert(name.clone(), value).is_none(),
+            "field {name:?} given with both --set and --gen"
+        );
+    }
+    Ok((fields, public, generated))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -701,17 +925,19 @@ fn submit(
     ty: EntryType,
     fields: Fields,
     public: Vec<String>,
+    binary: BTreeSet<String>,
     labels: Labels,
     description: Option<String>,
     pending_only: bool,
     rotate: bool,
-) -> Result<()> {
+) -> Result<Option<EntryRecord>> {
     let mut vault = Vault::open(dir, true)?;
     let candidate = vault.submit(
         entry,
         ty,
         fields,
         public.into_iter().collect(),
+        binary,
         labels,
         description,
         rotate,
@@ -726,14 +952,14 @@ fn submit(
             "{entry} v{} written as pending candidate {}; activate with `jinnang pending activate {}`",
             candidate.header.version, candidate.id, candidate.id
         );
-        return Ok(());
+        return Ok(None);
     };
     let keys = vault
         .unlock(&passphrase)
         .with_context(|| format!("candidate {} left pending", candidate.id))?;
     let record = vault.activate(&keys, &candidate.id)?;
     println!("stored {} v{}", record.entry_ref, record.current);
-    Ok(())
+    Ok(Some(record))
 }
 
 fn pending(dir: &Path, action: PendingAction) -> Result<()> {
@@ -829,6 +1055,7 @@ fn entry_json(e: &EntryRecord) -> serde_json::Value {
         "updated_at": e.updated_at,
         "public": e.public,
         "secret_fields": e.secret_fields,
+        "binary_fields": e.binary_fields,
         "versions": e.versions.iter().map(|v| v.version).collect::<Vec<_>>(),
     })
 }

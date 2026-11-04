@@ -64,6 +64,16 @@ fn field<'a>(payload: &'a Payload, name: &str) -> Result<&'a Zeroizing<String>> 
         .with_context(|| format!("entry has no field {name:?}"))
 }
 
+/// Bytes for byte channels (files, stdin): binary fields are decoded, text as-is.
+fn field_bytes(payload: &Payload, name: &str) -> Result<Zeroizing<Vec<u8>>> {
+    let value = field(payload, name)?;
+    if payload.binary_fields.contains(name) {
+        schema::decode_binary(value)
+    } else {
+        Ok(Zeroizing::new(value.as_bytes().to_vec()))
+    }
+}
+
 fn dotenv(payload: &Payload) -> Result<Zeroizing<String>> {
     let mut out = Zeroizing::new(String::new());
     for (k, v) in &payload.fields {
@@ -178,16 +188,25 @@ fn pump(mut from: impl Read, mut to: impl Write, mut redactor: Redactor) -> usiz
     }
 }
 
+/// Secret values to redact: the stored text and, for binary fields, the decoded bytes.
 fn secret_values(payload: &Payload) -> Vec<Zeroizing<Vec<u8>>> {
-    payload
-        .fields
-        .iter()
-        .filter(|(k, _)| schema::is_secret(payload.header.ty, k, &payload.public_fields))
-        .map(|(_, v)| Zeroizing::new(v.as_bytes().to_vec()))
-        .collect()
+    let mut out = Vec::new();
+    for (k, v) in &payload.fields {
+        if !schema::is_secret(payload.header.ty, k, &payload.public_fields) {
+            continue;
+        }
+        out.push(Zeroizing::new(v.as_bytes().to_vec()));
+        if payload.binary_fields.contains(k)
+            && let Ok(raw) = schema::decode_binary(v)
+        {
+            out.push(raw);
+        }
+    }
+    out
 }
 
-fn session_hints() -> serde_json::Value {
+/// Session identifiers recorded with every audit event.
+pub fn session_hints() -> serde_json::Value {
     let mut hints = BTreeMap::new();
     for key in [
         "CLAUDE_CODE_SESSION_ID",
@@ -204,9 +223,11 @@ fn session_hints() -> serde_json::Value {
 }
 
 /// Runs `argv` with the requested fields injected. Returns the child's exit code.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     vault_dir: &Path,
     entry_ref: Option<&EntryRef>,
+    version: Option<u32>,
     selector: Option<&Selector>,
     spec: &RunSpec,
     argv: &[String],
@@ -216,7 +237,7 @@ pub fn run(
     let vault = Vault::open(vault_dir, false)?;
     let target = vault.resolve(entry_ref, selector)?.entry_ref.clone();
     let keys = vault.unlock(passphrase)?;
-    let (record, payload) = vault.read_current(&keys.age, &target)?;
+    let (record, payload) = vault.read_at(&keys.age, &target, version)?;
     drop(keys);
     let ty = payload.header.ty;
 
@@ -232,7 +253,7 @@ pub fn run(
     let stdin_value = spec
         .stdin
         .as_deref()
-        .map(|f| field(&payload, f).cloned())
+        .map(|f| field_bytes(&payload, f))
         .transpose()?;
 
     let tmp = if spec.files.is_empty() && spec.env_files.is_empty() {
@@ -245,7 +266,7 @@ pub fn run(
         let path = tmp
             .as_ref()
             .unwrap()
-            .write(name, field(&payload, f)?.as_bytes())?;
+            .write(name, &field_bytes(&payload, f)?)?;
         paths.insert(name.clone(), path);
     }
     for name in &spec.env_files {
@@ -291,7 +312,7 @@ pub fn run(
     let caller = crate::store::submitter();
     vault.audit(json!({
         "event": "run.start", "operation_id": op, "ref": record.entry_ref.to_string(), "entry_id": record.id,
-        "version": record.current, "fields": used, "argv": logged_argv,
+        "version": payload.header.version, "fields": used, "argv": logged_argv,
         "cwd": std::env::current_dir().ok().map(|p| p.display().to_string()),
         "caller": caller, "session": session_hints(), "redact": spec.redact,
     }))
@@ -326,7 +347,7 @@ pub fn run(
     let writer = stdin_value.map(|v| {
         let mut stdin = child.stdin.take().unwrap();
         thread::spawn(move || {
-            let _ = stdin.write_all(v.as_bytes());
+            let _ = stdin.write_all(&v);
         })
     });
     let pumps: Vec<_> = if spec.redact {

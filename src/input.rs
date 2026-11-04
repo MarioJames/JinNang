@@ -110,10 +110,12 @@ fn prompt_line(tty: &mut File, prompt: &str) -> Result<String> {
 
 /// Prompts on the terminal for every field of `ty`, then for each custom field in
 /// `extra`. Secret values are read without echo; multi-line values from a file path.
+/// Fields already given another way (`--from-file`) are in `skip` and not prompted.
 pub fn prompt_fields(
     ty: EntryType,
     extra: &[String],
     public: &std::collections::BTreeSet<String>,
+    skip: &std::collections::BTreeSet<String>,
 ) -> Result<Fields> {
     ensure!(
         ty != EntryType::EnvBundle,
@@ -125,7 +127,7 @@ pub fn prompt_fields(
     );
     let mut tty = tty().context("no terminal for prompts; use --stdin-json")?;
     let mut fields = Fields::new();
-    for spec in ty.fields() {
+    for spec in ty.fields().iter().filter(|s| !skip.contains(s.name)) {
         let label = format!(
             "{}{}",
             spec.name,
@@ -167,6 +169,17 @@ pub fn prompt_fields(
         fields.insert(name.clone(), value);
     }
     Ok(fields)
+}
+
+/// Reads a whole file as one field value. UTF-8 text without NUL bytes is kept as
+/// is; anything else is stored as base64 and the field is marked binary (`true`).
+pub fn read_file_field(path: &Path) -> Result<(Zeroizing<String>, bool)> {
+    let bytes =
+        Zeroizing::new(fs::read(path).with_context(|| format!("cannot read {}", path.display()))?);
+    match std::str::from_utf8(&bytes) {
+        Ok(text) if !text.contains('\0') => Ok((Zeroizing::new(text.to_string()), false)),
+        _ => Ok((crate::schema::encode_binary(&bytes), true)),
+    }
 }
 
 /// Reads `{"field": "value", ...}` from stdin.

@@ -1072,3 +1072,205 @@ fn self_held_vault_needs_no_human_passphrase() {
         .arg(env.path("kit.json")));
     assert!(restored.ok, "{}", restored.text);
 }
+
+#[test]
+fn gen_creates_usable_accounts_without_printing_secrets_and_rm_discards_them() {
+    let env = Env::new();
+    env.init();
+    let r = "jn://dev/acme/qa-01";
+    let out = run(env.cmd().args([
+        "gen",
+        r,
+        "--set",
+        "username=qa-01",
+        "--set",
+        "login_url=https://acme.test/login",
+        "-l",
+        "env=dev",
+        "--desc",
+        "acme dev QA account created by an agent",
+    ]));
+    assert!(out.ok, "{}", out.text);
+    assert!(out.text.contains("generated password"), "{}", out.text);
+    assert!(
+        out.text.contains("qa-01"),
+        "public fields are shown: {}",
+        out.text
+    );
+
+    // The child gets a strong 24-character password; the caller only sees the redaction.
+    let check = r#"test "$U" = qa-01 && test ${#P} -eq 24 && echo "$P" | grep -q '[a-z]' && echo "$P" | grep -q '[A-Z]' && echo "$P" | grep -q '[0-9]' && echo "pw=$P""#;
+    let out = run(env.cmd().args([
+        "run",
+        r,
+        "--env",
+        "U=username",
+        "--env",
+        "P=password",
+        "--",
+        "sh",
+        "-c",
+        check,
+    ]));
+    assert!(out.ok, "{}", out.text);
+    assert!(out.text.contains("pw=[jinnang:redacted]"), "{}", out.text);
+
+    // Secrets never go through argv, and a taken name is not overwritten.
+    let out = run(env.cmd().args([
+        "gen",
+        "jn://dev/acme/qa-02",
+        "--set",
+        "username=x",
+        "--set",
+        "password=hunter22",
+    ]));
+    assert!(
+        !out.ok && out.text.contains("--gen password"),
+        "{}",
+        out.text
+    );
+    assert!(!run(env.cmd().args(["gen", r, "--set", "username=qa-01"])).ok);
+
+    // Registration failed: discard the entry, then the same name can be generated again.
+    assert!(run(env.cmd().args(["rm", r])).ok);
+    assert!(ls_refs(&env, "env=dev").is_empty());
+    let out = run(env.cmd().args([
+        "gen",
+        r,
+        "--set",
+        "username=qa-01",
+        "--length",
+        "40",
+        "--charset",
+        "alnum",
+    ]));
+    assert!(out.ok, "{}", out.text);
+    let check = r#"test ${#P} -eq 40 && ! echo "$P" | grep -q '[^A-Za-z0-9]'"#;
+    assert!(
+        run(env
+            .cmd()
+            .args(["run", r, "--env", "P=password", "--", "sh", "-c", check]))
+        .ok
+    );
+
+    // Custom fields: generated ones are secret, --set ones public.
+    let out = run(env.cmd().args([
+        "gen",
+        "jn://dev/acme/webhook",
+        "--type",
+        "generic",
+        "--gen",
+        "signing_secret",
+        "--set",
+        "endpoint=https://hook.test",
+    ]));
+    assert!(out.ok, "{}", out.text);
+    let v: Value = serde_json::from_str(
+        &run(env
+            .cmd()
+            .args(["inspect", "jn://dev/acme/webhook", "--json"]))
+        .text,
+    )
+    .unwrap();
+    assert_eq!(v["secret_fields"], serde_json::json!(["signing_secret"]));
+    assert_eq!(v["public"]["endpoint"], "https://hook.test");
+
+    let audit = fs::read_to_string(env.vault().join("audit.jsonl")).unwrap();
+    let events: Vec<Value> = audit
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(events.iter().filter(|e| e["event"] == "gen").count(), 3);
+    assert!(events.iter().any(|e| e["event"] == "rm" && e["ref"] == r));
+}
+
+#[test]
+fn files_are_stored_by_content_and_restored_byte_for_byte() {
+    let env = Env::new();
+    env.init();
+    let cert: Vec<u8> = (0u8..=255).cycle().take(3000).collect();
+    fs::write(env.path("cert.p12"), &cert).unwrap();
+    fs::write(
+        env.path("key.pem"),
+        "-----BEGIN KEY-----\nabc123secret\n-----END KEY-----\n",
+    )
+    .unwrap();
+    let r = "jn://signing/macos";
+    let out = run(env
+        .cmd()
+        .args(["set", r, "--from-file"])
+        .arg(format!("p12={}", env.path("cert.p12").display()))
+        .arg("--from-file")
+        .arg(format!("pem={}", env.path("key.pem").display())));
+    assert!(out.ok, "{}", out.text);
+    fs::remove_file(env.path("cert.p12")).unwrap();
+
+    let out = run(env.cmd().args(["inspect", r]));
+    assert!(
+        out.text.contains("p12") && out.text.contains("<secret, binary>"),
+        "{}",
+        out.text
+    );
+
+    // --file restores the original bytes; text files stay text.
+    let out = run(env
+        .cmd()
+        .args([
+            "run", r, "--file", "C=p12", "--file", "K=pem", "--", "sh", "-c",
+        ])
+        .arg(format!(
+            r#"cp "$C" '{}' && grep -q abc123secret "$K""#,
+            env.path("restored.p12").display()
+        )));
+    assert!(out.ok, "{}", out.text);
+    assert_eq!(fs::read(env.path("restored.p12")).unwrap(), cert);
+
+    // --env carries base64 (what CSC_LINK-style variables accept).
+    let out = run(env
+        .cmd()
+        .args([
+            "run",
+            r,
+            "--env",
+            "B=p12",
+            "--",
+            "sh",
+            "-c",
+            r#"printf %s "$B" | base64 -d | cmp -s - "$1""#,
+            "sh",
+        ])
+        .arg(env.path("restored.p12")));
+    assert!(out.ok, "{}", out.text);
+
+    assert!(run(env.cmd().args(["verify", "--deep"])).ok);
+}
+
+#[test]
+fn run_uses_an_older_version_when_asked() {
+    let env = Env::new();
+    env.init();
+    assert!(env.set_dsn(DB_PASSWORD).ok);
+    let json = r#"{"driver":"postgres","host":"db.internal","database":"app","username":"app_rw","password":"rotated-password-2"}"#;
+    assert!(
+        run(env
+            .cmd()
+            .args(["rotate", "jn://prod/acme/app-db", "--stdin-json"])
+            .write_stdin(json))
+        .ok
+    );
+    let check = |reference: &str, expected: &str| {
+        run(env
+            .cmd()
+            .args(["run", reference, "--env", "P=password", "--", "sh", "-c"])
+            .arg(format!(r#"test "$P" = '{expected}'"#)))
+        .ok
+    };
+    assert!(check("jn://prod/acme/app-db", "rotated-password-2"));
+    assert!(check("jn://prod/acme/app-db@v1", DB_PASSWORD));
+    assert!(
+        !run(env
+            .cmd()
+            .args(["run", "jn://prod/acme/app-db@v9", "--", "true"]))
+        .ok
+    );
+}

@@ -67,6 +67,9 @@ pub struct EntryRecord {
     /// Non-secret field values of the current version.
     pub public: BTreeMap<String, String>,
     pub secret_fields: Vec<String>,
+    /// Fields stored as base64 of binary content (see `schema::check_binary`).
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub binary_fields: BTreeSet<String>,
     pub current: u32,
     pub deleted: bool,
     pub updated_at: String,
@@ -113,6 +116,8 @@ pub struct Payload {
     pub description: Option<String>,
     pub fields: Fields,
     pub public_fields: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub binary_fields: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -495,6 +500,7 @@ impl Vault {
         ty: EntryType,
         mut fields: Fields,
         public_fields: BTreeSet<String>,
+        binary_fields: BTreeSet<String>,
         mut labels: Labels,
         mut description: Option<String>,
         rotate: bool,
@@ -525,6 +531,7 @@ impl Vault {
             (None, false) => (Uuid::new_v4(), 1),
         };
         schema::normalize(ty, &mut fields, &public_fields)?;
+        schema::check_binary(&fields, &binary_fields)?;
         let header = Header {
             vault_id: self.meta.vault_id,
             entry_id,
@@ -538,6 +545,7 @@ impl Vault {
             description: description.clone(),
             fields,
             public_fields,
+            binary_fields,
         };
         let plaintext = Zeroizing::new(serde_json::to_vec(&payload)?);
         let ciphertext = crypto::encrypt(&self.recipients()?, &plaintext)?;
@@ -626,6 +634,8 @@ impl Vault {
         let mut check = payload.fields.clone();
         schema::normalize(h.ty, &mut check, &payload.public_fields)
             .with_context(|| format!("pending candidate {id} is invalid"))?;
+        schema::check_binary(&payload.fields, &payload.binary_fields)
+            .with_context(|| format!("pending candidate {id} is invalid"))?;
         ensure!(
             check == payload.fields,
             "pending candidate {id} is not normalized"
@@ -687,6 +697,7 @@ impl Vault {
                 e.description = payload.description.clone();
                 e.public = public;
                 e.secret_fields = secret_fields;
+                e.binary_fields = payload.binary_fields.clone();
                 e.updated_at = now();
                 e.clone()
             }
@@ -699,6 +710,7 @@ impl Vault {
                     description: payload.description.clone(),
                     public,
                     secret_fields,
+                    binary_fields: payload.binary_fields.clone(),
                     current: 1,
                     deleted: false,
                     updated_at: now(),
@@ -869,15 +881,26 @@ impl Vault {
         identity: &x25519::Identity,
         entry_ref: &EntryRef,
     ) -> Result<(EntryRecord, Payload)> {
+        self.read_at(identity, entry_ref, None)
+    }
+
+    /// Decrypts version `version` of an entry, or the current one for `None`.
+    pub fn read_at(
+        &self,
+        identity: &x25519::Identity,
+        entry_ref: &EntryRef,
+        version: Option<u32>,
+    ) -> Result<(EntryRecord, Payload)> {
         let e = self
             .find(entry_ref)
             .with_context(|| format!("{entry_ref} does not exist"))?
             .clone();
+        let wanted = version.unwrap_or(e.current);
         let v = e
             .versions
             .iter()
-            .find(|v| v.version == e.current)
-            .context("current version missing from manifest")?;
+            .find(|v| v.version == wanted)
+            .with_context(|| format!("{entry_ref} has no version v{wanted}"))?;
         let payload = self.read_version(identity, &e, v)?;
         Ok((e, payload))
     }
@@ -927,13 +950,17 @@ impl Vault {
                     Ok(p) => {
                         report.decrypted += 1;
                         let mut check = p.fields.clone();
-                        if schema::normalize(e.ty, &mut check, &p.public_fields).is_err() {
+                        if schema::normalize(e.ty, &mut check, &p.public_fields).is_err()
+                            || schema::check_binary(&p.fields, &p.binary_fields).is_err()
+                        {
                             report.problems.push(format!(
                                 "{} v{}: payload fails validation",
                                 e.entry_ref, v.version
                             ));
                         } else if v.version == e.current
-                            && split_fields(e.ty, &p) != (e.public.clone(), e.secret_fields.clone())
+                            && (split_fields(e.ty, &p)
+                                != (e.public.clone(), e.secret_fields.clone())
+                                || p.binary_fields != e.binary_fields)
                         {
                             report.problems.push(format!(
                                 "{} v{}: public fields differ from manifest",

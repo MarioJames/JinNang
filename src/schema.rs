@@ -266,6 +266,31 @@ pub fn normalize(
     Ok(())
 }
 
+/// Binary fields hold the standard base64 of the original bytes (for example a
+/// `.p12` certificate read with `--from-file`); `run --file` and `--stdin` write
+/// the decoded bytes, text channels (env, dotenv) carry the base64.
+pub fn check_binary(fields: &Fields, binary: &BTreeSet<String>) -> Result<()> {
+    for name in binary {
+        let value = fields
+            .get(name)
+            .with_context(|| format!("binary field {name:?} is not part of the entry"))?;
+        decode_binary(value)
+            .with_context(|| format!("binary field {name:?} is not valid base64"))?;
+    }
+    Ok(())
+}
+
+pub fn encode_binary(bytes: &[u8]) -> Zeroizing<String> {
+    Zeroizing::new(data_encoding::BASE64.encode(bytes))
+}
+
+pub fn decode_binary(value: &str) -> Result<Zeroizing<Vec<u8>>> {
+    data_encoding::BASE64
+        .decode(value.as_bytes())
+        .map(Zeroizing::new)
+        .map_err(|_| anyhow::anyhow!("not valid base64"))
+}
+
 fn check_port(fields: &Fields) -> Result<()> {
     if let Some(p) = fields.get("port")
         && !p.parse::<u16>().is_ok_and(|p| p > 0)

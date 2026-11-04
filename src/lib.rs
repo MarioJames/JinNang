@@ -1,6 +1,7 @@
 //! Jinnang: a local credential vault for AI agents.
 
 pub mod crypto;
+pub mod generate;
 pub mod input;
 pub mod refs;
 pub mod run;
