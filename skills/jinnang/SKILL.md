@@ -16,6 +16,7 @@ Jinnang 是本机的凭证库。你只持有 `jn://` 引用，由 `jinnang` 把�
 - 缺凭证时运行 `jinnang need`，把它打印的命令交给用户在自己的终端执行；不要让用户把值粘贴进对话。
 - 口令不归你管：`jinnang` 自己解封口令，你不传、不找、不设置任何口令或口令文件。
 - 不绕过工具：不读取 vault 目录、封存的口令或恢复包，不调用 `systemd-creds` 解密，不用 `--no-redact` 输出秘密，不把注入的值 `echo` 出来。
+- 不从 `run` 的输出取值：`jinnang run … -- sh -c 'printf "$K"' | 下一个命令` 里，下一个命令收到的是 `[jinnang:redacted]`，不是秘密；stderr 出现 `got the placeholder` 提示就是这种情况。下游报「令牌无效 / 认证失败」时先排除这一点，不要据此判断凭证或对方系统有问题。管道、远程 shell、`kubectl exec` 都放进 `--` 后的命令里（见下文「交给远端」）。
 - 疑似泄露时停下，报告引用，由用户在源系统轮换。
 
 ## 找到要用的账号
@@ -58,7 +59,7 @@ Jinnang 是本机的凭证库。你只持有 `jn://` 引用，由 `jinnang` 把�
 | 私有文件 | `--file NAME=field` | 0600 临时文件，内容是原始文件（二进制字段已解码）；`$NAME` 和参数中的 `{NAME}` 替换为路径，结束即删 |
 | dotenv 文件 | `--env-file NAME` | 全部字段写成 dotenv 文件，同上 |
 
-引用末尾加 `@vN`（如 `jn://acme/app-db@v1`）使用历史版本，`inspect` 列出现有版本。输出中出现的秘密值会被替换成 `[jinnang:redacted]`，退出码原样返回。值不要放进命令行参数（其他进程能从 `/proc` 看到）；需要拼接时在子 shell 里用内建命令处理：
+引用末尾加 `@vN`（如 `jn://acme/app-db@v1`）使用历史版本，`inspect` 列出现有版本。输出中出现的秘密值会被替换成 `[jinnang:redacted]`，并在 stderr 提示替换了几处；退出码原样返回。值不要放进命令行参数（其他进程能从 `/proc` 看到）；需要拼接时在子 shell 里用内建命令处理：
 
 ```bash
 # 数据库
@@ -77,6 +78,13 @@ jinnang run jn://ssh/web2 --env SSHPASS_VALUE=password --env H=host --env U=user
 # HTTP token：请求头经 stdin 交给 curl，不进参数
 jinnang run jn://cloudflare/main --env T=token -- \
   sh -c 'printf "Authorization: Bearer %s\n" "$T" | curl -sS -H @- https://api.example.com/v1/me'
+
+# 交给远端（SSH 主机、容器、Pod）：远程命令是子进程，值经它的 stdin 过去
+jinnang run jn://acme/api --stdin token -- \
+  ssh ops@bastion 'read -r T; curl -sS -H "Authorization: Bearer $T" https://api.example.com/v1/me'
+# 远端还要读脚本时，在子 shell 里把值和脚本拼进同一个 stdin
+jinnang run jn://acme/api --env T=token -- sh -c '
+  { printf "%s\n" "$T"; cat probe.sh; } | ssh ops@bastion "kubectl exec -i deploy/app -- sh -c \"read -r T; export T; sh -s\""'
 
 # 应用配置：整包 .env
 jinnang run jn://local/app-env --env-file CREDS -- ./deploy.sh --env-file {CREDS}

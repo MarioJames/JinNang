@@ -368,6 +368,16 @@ pub fn run(
     }
     let redactions: usize = pumps.into_iter().map(|p| p.join().unwrap_or(0)).sum();
     drop(tmp);
+    if redactions > 0 {
+        // Silent substitution looks like a wrong or revoked secret downstream.
+        eprintln!(
+            "jinnang: replaced {redactions} secret value(s) in the command's output with {}; \
+             whatever read that output (a pipe, a file, a remote shell) got the placeholder, \
+             not the secret. To hand the secret to another program, make that program the \
+             command (or pipe inside the command) and pass the value with --env, --stdin or --file.",
+            String::from_utf8_lossy(REDACTED)
+        );
+    }
 
     use std::os::unix::process::ExitStatusExt;
     let code = status

@@ -549,6 +549,50 @@ fn run_injects_fields_redacts_output_and_audits() {
     );
 }
 
+#[test]
+fn piping_a_secret_out_of_run_warns_that_the_reader_got_the_placeholder() {
+    let env = Env::new();
+    env.init();
+    assert!(env.set_dsn(DB_PASSWORD).ok);
+    let r = "jn://prod/acme/app-db";
+
+    // An agent "exports" the value to the next command in a pipeline: the next
+    // command silently receives the placeholder, so jinnang must say so.
+    let out = env
+        .cmd()
+        .args([
+            "run",
+            r,
+            "--env",
+            "K=password",
+            "--",
+            "sh",
+            "-c",
+            r#"printf %s "$K""#,
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "[jinnang:redacted]");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("got the placeholder"), "{stderr}");
+    assert!(stderr.contains("--stdin"), "{stderr}");
+    assert_no_secret(&stderr);
+
+    // Output without the value: no warning.
+    let out = env
+        .cmd()
+        .args(["run", r, "--env", "K=password", "--", "sh", "-c", "echo ok"])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 fn ls_refs(env: &Env, selector: &str) -> Vec<String> {
     let out = run(env.cmd().args(["ls", "--json", "-l", selector]));
     assert!(out.ok, "{}", out.text);
