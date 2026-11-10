@@ -1,0 +1,122 @@
+name: CI and release
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Serialize main builds so an older run cannot replace a newer Latest release.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: bash -n install.sh
+      - run: shellcheck install.sh
+
+  native:
+    name: Test and build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    env:
+      CARGO_BUILD_TARGET: ${{ matrix.target }}
+      # All dependencies are Rust; rust-lld links the bundled musl CRT directly.
+      RUSTFLAGS: -C linker=rust-lld
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked
+      - run: cargo build --locked --release
+      - run: cargo test --locked --release --test install
+      - name: Package and smoke-test the release binary
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          binary="target/$TARGET/release/jinnang"
+          "$binary" --version
+          "$binary" --help
+          if readelf -l "$binary" | grep -q INTERP; then
+            echo 'Expected a static binary without an ELF interpreter' >&2
+            exit 1
+          fi
+          mkdir -p dist
+          tar -czf "dist/jinnang-$TARGET.tar.gz" -C "target/$TARGET/release" jinnang
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jinnang-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    needs: [check, native]
+    if: >-
+      github.repository == 'MarioJames/JinNang' &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: jinnang-*
+          path: dist
+          merge-multiple: true
+      - name: Publish tested binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          tag="main-$GITHUB_SHA"
+          cp install.sh dist/install.sh
+          (cd dist && sha256sum jinnang-*.tar.gz install.sh > SHA256SUMS)
+          cat > "$RUNNER_TEMP/release-notes.md" <<EOF
+          主线自动构建，提交：$GITHUB_SHA
+
+          安装或升级（Linux x86_64 / ARM64）：
+
+          \`\`\`sh
+          curl -fsSLo jinnang-install.sh https://github.com/MarioJames/JinNang/releases/latest/download/install.sh && bash jinnang-install.sh
+          \`\`\`
+
+          默认安装到 \`~/.local/bin\`。指定本次构建：在安装命令的 \`bash\` 前加 \`JINNANG_VERSION=$tag\`。
+          二进制静态链接 musl，安装前自动校验 SHA-256。Cargo 版本来自 Cargo.toml，构建身份以 release tag 和提交为准。
+          EOF
+          gh release create "$tag" dist/* --draft --target "$GITHUB_SHA" \
+            --title "$tag" --notes-file "$RUNNER_TEMP/release-notes.md"
+          gh release edit "$tag" --draft=false --latest

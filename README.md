@@ -34,11 +34,42 @@ Jinnang 的做法：
 
 ## 安装
 
+Linux x86_64 / ARM64 可直接安装预编译二进制，不需要 Rust 或 root：
+
 ```sh
-cargo install --path .
+curl -fsSLo jinnang-install.sh https://github.com/MarioJames/JinNang/releases/latest/download/install.sh && bash jinnang-install.sh
 ```
 
-需要 Linux 与 Rust 1.88+。
+默认安装到 `~/.local/bin`，升级时重新执行同一命令。目录不在 `PATH` 时，把下面一行加到 `~/.bashrc` 或 `~/.zshrc`，再重新打开终端：
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+jinnang --version
+```
+
+安装脚本先固定最新 release 的 tag，再下载对应架构的静态 musl 二进制，校验 SHA-256 并试运行，成功后原子替换旧文件。下载、校验或试运行失败时保留旧版本。安装和升级都不改 vault、信任状态或 systemd 封存凭证；免交互解锁仍需要支持用户级加密凭证的 systemd 256+。
+
+也可以指定安装目录或安装某次历史构建（从 [Releases](https://github.com/MarioJames/JinNang/releases) 复制完整 tag）：
+
+```sh
+JINNANG_INSTALL_DIR="$HOME/bin" bash jinnang-install.sh
+read -r -p 'Release tag: ' release_tag
+JINNANG_VERSION="$release_tag" bash jinnang-install.sh
+```
+
+指定版本时粘贴 Releases 页中的完整 tag。卸载只需删除安装目录中的 `jinnang`；凭证数据继续保留。
+
+从源码安装（需要 Linux 与 Rust；CI 使用 Rust 1.98.0）：
+
+```sh
+cargo install --locked --path .
+```
+
+### 自动发布
+
+PR 会执行格式、Clippy、安装脚本检查，以及 Linux x86_64 / ARM64 的测试和 release 构建。合入 `main` 后，同样的检查全部通过才会创建 `main-<完整提交SHA>` GitHub Release，并标为 Latest。Release 包含两个架构的 `.tar.gz`、`install.sh` 和 `SHA256SUMS`，只使用 GitHub 自带的 `GITHUB_TOKEN`，不需要配置发布密钥。
+
+每个提交的 release 独立保留，不覆盖历史产物；Cargo 版本取自 `Cargo.toml`，具体构建以 release tag 和提交为准。默认分支也可手动运行 `CI and release` 工作流；同一提交已发布时不重复发布或覆盖。发布先创建草稿、上传产物，最后公开，上传失败不会把缺产物的版本标为 Latest。
 
 ## 使用
 
