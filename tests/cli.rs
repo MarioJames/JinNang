@@ -550,6 +550,132 @@ fn run_injects_fields_redacts_output_and_audits() {
 }
 
 #[test]
+fn run_returns_after_child_exit_with_background_output_holders() {
+    let env = Env::new();
+    env.init();
+    assert!(env.set_dsn(DB_PASSWORD).ok);
+    let pid_file = env.path("holder.pid");
+    let out = env
+        .cmd()
+        .env("HOLDER_PID_FILE", &pid_file)
+        .args([
+            "run",
+            "jn://prod/acme/app-db",
+            "--env",
+            "K=password",
+            "--",
+            "sh",
+            "-c",
+            r#"sleep 60 &
+               echo $! > "$HOLDER_PID_FILE"
+               printf 'public stdout\n%s' "$K"
+               printf 'public stderr\n%s' "$K" >&2
+               exit 7"#,
+        ])
+        // Deadlock guard: the background holder is cleaned up explicitly below.
+        .timeout(std::time::Duration::from_secs(10))
+        .output();
+    if let Ok(pid) = fs::read_to_string(&pid_file) {
+        std::process::Command::new("kill")
+            .args(["-TERM", pid.trim()])
+            .output()
+            .unwrap();
+    }
+    let out = out.unwrap();
+    assert_eq!(out.status.code(), Some(7));
+    assert_eq!(out.stdout, b"public stdout\n[jinnang:redacted]");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.starts_with("public stderr\n[jinnang:redacted]"));
+    assert!(stderr.contains("replaced 2 secret value(s)"));
+    assert_no_secret(&stderr);
+}
+
+#[test]
+fn run_returns_after_child_exit_with_background_stdin_holder() {
+    let env = Env::new();
+    env.init();
+    assert!(env.set_dsn(&"s".repeat(256 * 1024)).ok);
+    let consumed = env
+        .cmd()
+        .args([
+            "run",
+            "jn://prod/acme/app-db",
+            "--stdin",
+            "password",
+            "--",
+            "wc",
+            "-c",
+        ])
+        .output()
+        .unwrap();
+    assert!(consumed.status.success());
+    assert_eq!(String::from_utf8_lossy(&consumed.stdout).trim(), "262144");
+    assert!(consumed.stderr.is_empty());
+    let pid_file = env.path("holder.pid");
+    let out = env
+        .cmd()
+        .env("HOLDER_PID_FILE", &pid_file)
+        .args([
+            "run",
+            "jn://prod/acme/app-db",
+            "--stdin",
+            "password",
+            "--",
+            "sh",
+            "-c",
+            r#"exec 3<&0
+               sleep 60 <&3 >/dev/null 2>&1 &
+               exec 3<&-
+               echo $! > "$HOLDER_PID_FILE"
+               printf done"#,
+        ])
+        .timeout(std::time::Duration::from_secs(10))
+        .output();
+    if let Ok(pid) = fs::read_to_string(&pid_file) {
+        std::process::Command::new("kill")
+            .args(["-TERM", pid.trim()])
+            .output()
+            .unwrap();
+    }
+    let out = out.unwrap();
+    assert!(out.status.success());
+    assert_eq!(out.stdout, b"done");
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
+fn run_preserves_large_output_and_redacts_both_stream_tails() {
+    let env = Env::new();
+    env.init();
+    assert!(env.set_dsn(DB_PASSWORD).ok);
+    let out = env
+        .cmd()
+        .args([
+            "run",
+            "jn://prod/acme/app-db",
+            "--env",
+            "K=password",
+            "--",
+            "sh",
+            "-c",
+            r#"head -c 131072 /dev/zero | tr '\0' x
+               printf '%s' "$K"
+               head -c 131072 /dev/zero | tr '\0' y >&2
+               printf '%s' "$K" >&2"#,
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let mut expected = vec![b'x'; 131072];
+    expected.extend_from_slice(b"[jinnang:redacted]");
+    assert_eq!(out.stdout, expected);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.starts_with(&("y".repeat(131072) + "[jinnang:redacted]")));
+    assert!(stderr.contains("replaced 2 secret value(s)"));
+    assert_no_secret(&stderr);
+}
+
+#[test]
 fn piping_a_secret_out_of_run_warns_that_the_reader_got_the_placeholder() {
     let env = Env::new();
     env.init();
