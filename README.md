@@ -134,6 +134,8 @@ jinnang --vault ~/new-vault restore --from vault.backup --recovery-kit ~/jinnang
 jinnang need jn://acme/cf-token --type api_token -l env=prod --reason "部署 DNS"
 ```
 
+`run` 以 `--` 后直接启动的命令为生命周期：该命令退出后，读完 stdout/stderr 已缓冲的数据并完成脱敏，再返回原退出码；后台进程继续持有管道不会阻塞返回，之后的新输出不再收集。stdin 注入也随主命令退出结束。复制密码到 Wayland 剪贴板可直接用 `jinnang run jn://work/app --stdin password -- wl-copy`，不需要额外重定向。
+
 ### 命名与标签
 
 名称是自由路径 `jn://<path>[#field][@vN]`（1–8 段，小写字母、数字和 `. _ -`），工具不规定各段含义。环境、租户、角色这类分类放在标签里，按需组合查询。例如：

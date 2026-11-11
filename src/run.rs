@@ -8,9 +8,12 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Write};
+use std::os::fd::AsFd;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::thread;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -174,7 +177,7 @@ impl Redactor {
     }
 }
 
-fn pump(mut from: impl Read, mut to: impl Write, mut redactor: Redactor) -> usize {
+fn pump_buffered(mut from: impl Read, mut to: impl Write, mut redactor: Redactor) -> usize {
     let mut chunk = [0u8; 8192];
     loop {
         let (n, eof) = match from.read(&mut chunk) {
@@ -186,6 +189,97 @@ fn pump(mut from: impl Read, mut to: impl Write, mut redactor: Redactor) -> usiz
             return redactor.hits;
         }
     }
+}
+
+/// Wait for stream readiness or for the directly launched command to exit.
+/// Dropping the peer wakes every worker without waiting for inherited pipe EOF.
+fn wait_for_io(
+    fd: &impl AsFd,
+    events: rustix::event::PollFlags,
+    finished: &UnixStream,
+) -> Result<bool> {
+    use rustix::event::{PollFd, PollFlags, poll};
+    let mut fds = [
+        PollFd::new(fd, events),
+        PollFd::new(finished, PollFlags::IN),
+    ];
+    loop {
+        match poll(&mut fds, None) {
+            Ok(_) => return Ok(!fds[1].revents().is_empty()),
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+fn nonblocking(fd: &impl AsFd) -> Result<()> {
+    use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+    fcntl_setfl(fd, fcntl_getfl(fd)? | OFlags::NONBLOCK)?;
+    Ok(())
+}
+
+fn pump(
+    mut from: impl Read + AsFd,
+    mut to: impl Write,
+    mut redactor: Redactor,
+    finished: Arc<UnixStream>,
+) -> Result<usize> {
+    nonblocking(&from)?;
+    let mut chunk = [0u8; 8192];
+    loop {
+        if wait_for_io(&from, rustix::event::PollFlags::IN, &finished)? {
+            // All output emitted by the child before exit is already in the
+            // pipe. Drain exactly that snapshot, then flush the redactor's tail.
+            // An active descendant must not extend this drain indefinitely.
+            let buffered = rustix::io::ioctl_fionread(&from)?;
+            return Ok(pump_buffered(from.take(buffered), to, redactor));
+        }
+        let (n, eof) = match from.read(&mut chunk) {
+            Ok(0) => (0, true),
+            Ok(n) => (n, false),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let out = redactor.push(&chunk[..n], eof);
+        if to.write_all(&out).and_then(|_| to.flush()).is_err() || eof {
+            return Ok(redactor.hits);
+        }
+    }
+}
+
+fn feed_stdin(
+    mut into: std::process::ChildStdin,
+    value: Zeroizing<Vec<u8>>,
+    finished: Arc<UnixStream>,
+) -> Result<()> {
+    nonblocking(&into)?;
+    let mut remaining = value.as_slice();
+    while !remaining.is_empty() {
+        if wait_for_io(&into, rustix::event::PollFlags::OUT, &finished)? {
+            break;
+        }
+        match into.write(remaining) {
+            Ok(0) => break,
+            Ok(n) => remaining = &remaining[n..],
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                continue;
+            }
+            Err(_) => break, // The command is allowed to close stdin early.
+        }
+    }
+    Ok(())
 }
 
 /// Secret values to redact: the stored text and, for binary fields, the decoded bytes.
@@ -334,6 +428,8 @@ pub fn run(
     if spec.redact {
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     }
+    let (finished, finish) = UnixStream::pair().context("cannot create run completion signal")?;
+    let finished = Arc::new(finished);
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -345,29 +441,36 @@ pub fn run(
     drop(env);
 
     let writer = stdin_value.map(|v| {
-        let mut stdin = child.stdin.take().unwrap();
-        thread::spawn(move || {
-            let _ = stdin.write_all(&v);
-        })
+        let stdin = child.stdin.take().unwrap();
+        let finished = Arc::clone(&finished);
+        thread::spawn(move || feed_stdin(stdin, v, finished))
     });
     let pumps: Vec<_> = if spec.redact {
         let out = child.stdout.take().unwrap();
         let err = child.stderr.take().unwrap();
         let (a, b) = (secret_values(&payload), secret_values(&payload));
+        let (out_finished, err_finished) = (Arc::clone(&finished), Arc::clone(&finished));
         vec![
-            thread::spawn(move || pump(out, std::io::stdout(), Redactor::new(a))),
-            thread::spawn(move || pump(err, std::io::stderr(), Redactor::new(b))),
+            thread::spawn(move || pump(out, std::io::stdout(), Redactor::new(a), out_finished)),
+            thread::spawn(move || pump(err, std::io::stderr(), Redactor::new(b), err_finished)),
         ]
     } else {
         Vec::new()
     };
     drop(payload);
-    let status = child.wait()?;
+    let status = child.wait();
+    drop(finish); // Wake stdin and both output workers, including on wait errors.
     if let Some(w) = writer {
         let _ = w.join();
     }
-    let redactions: usize = pumps.into_iter().map(|p| p.join().unwrap_or(0)).sum();
+    // Join every worker before propagating a failure or removing private files.
+    let results: Vec<_> = pumps.into_iter().map(|p| p.join()).collect();
     drop(tmp);
+    let status = status?;
+    let mut redactions = 0;
+    for result in results {
+        redactions += result.map_err(|_| anyhow::anyhow!("output worker panicked"))??;
+    }
     if redactions > 0 {
         // Silent substitution looks like a wrong or revoked secret downstream.
         eprintln!(
