@@ -38,6 +38,12 @@ struct Cli {
 }
 
 const SKILL: &str = include_str!("../skills/jinnang/SKILL.md");
+/// What SKILL.md links to. An agent without the installed skill directory cannot
+/// follow those links, so `--skill` prints these after the skill itself.
+const SKILL_REFERENCES: [&str; 2] = [
+    include_str!("../skills/jinnang/references/recipes.md"),
+    include_str!("../skills/jinnang/references/store.md"),
+];
 
 /// An entry given by name, or by a selector that must match exactly one entry.
 #[derive(clap::Args)]
@@ -387,6 +393,9 @@ fn parse_labels(raw: &[String]) -> Result<Labels> {
 fn run(cli: Cli) -> Result<()> {
     if cli.skill {
         print!("{SKILL}");
+        for reference in SKILL_REFERENCES {
+            print!("\n{reference}");
+        }
         return Ok(());
     }
     let Some(command) = cli.command else {

@@ -956,6 +956,13 @@ fn agents_discover_entries_by_keywords_and_descriptions() {
         "{}",
         skill.text
     );
+    // SKILL.md links to its references; printed without the skill directory, they follow it.
+    for heading in ["\n# 更多注入配方\n", "\n# 存入新凭证\n"] {
+        assert!(
+            skill.text.contains(heading),
+            "--skill does not print {heading:?}"
+        );
+    }
     let help = run(env.cmd().arg("--help"));
     assert!(help.text.contains("jinnang --skill"), "{}", help.text);
 
